@@ -59,15 +59,51 @@ it("persists player and task changes atomically", async () => {
     ]);
     expect(player.girls.map(({ girlId }) => girlId)).toEqual([7, 9, 2]);
     expect(player.formations[0]?.fightCards).toHaveLength(3);
+    expect(player.levels).toEqual([]);
+    expect(player.money).toEqual([
+      { id: 1, count: 28 },
+      { id: 2, count: 0 },
+      { id: 3, count: 0 },
+    ]);
+    expect(player.items).toEqual([]);
     const loggedInPlayer = await repository.markLogin("tester");
     expect(loggedInPlayer.lastLoginAt).not.toBeNull();
     const renamedPlayer = await repository.rename("tester", "Commander");
     expect(renamedPlayer.name).toBe("Commander");
     await repository.setTaskValues("tester", [{ id: 123, value: 9 }]);
+    const enteredPlayer = await repository.enterLevel("tester", 3);
+    expect(enteredPlayer.money[0]?.count).toBe(25);
+    const settlement = await repository.settleLevel(
+      "tester",
+      1,
+      1,
+      1,
+      3,
+      [
+        [15, 1, 1, 1, 1_000, 0],
+        [7, 1, 4, 1, 2, 100],
+      ],
+      6,
+    );
+    expect(settlement.player.levels).toEqual([{ id: 65_793, star: 11 }]);
+    expect(settlement.player.exp).toBe(6);
+    expect(settlement.updatedMoney).toEqual([{ id: 2, count: 1_000 }]);
+    expect(settlement.updatedItems).toMatchObject([
+      { genre: 7, detail: 1, particular: 4, templateLevel: 1, count: 2 },
+    ]);
+    const completedPlayer = await repository.completeLevel("tester", 1, 1, 1, 5);
+    expect(completedPlayer.levels).toEqual([{ id: 65_793, star: 23 }]);
 
     const persisted = JSON.parse(await readFile(filePath, "utf8"));
+    expect(persisted.schemaVersion).toBe(4);
     expect(persisted.players.tester.name).toBe("Commander");
     expect(persisted.players.tester.taskValues["123"]).toBe(9);
+    expect(persisted.players.tester.levels).toEqual([{ id: 65_793, star: 23 }]);
+    expect(persisted.players.tester.money).toEqual([
+      { id: 1, count: 25 },
+      { id: 2, count: 1_000 },
+      { id: 3, count: 0 },
+    ]);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

@@ -2,7 +2,9 @@ import { describe, expect, it } from "vitest";
 
 import {
   makeItemNotification,
+  makeItemUpdateNotification,
   makeFormationUpdateNotification,
+  makeMoneyUpdateNotification,
   makePlayerNotification,
   makeServerLuaCall,
   makeTaskValueSync,
@@ -25,6 +27,13 @@ describe("game protocol", () => {
     registerTime: 1,
     lastLoginAt: null,
     taskValues: {},
+    items: [],
+    nextItemGuid: 20_001,
+    money: [
+      { id: 1, count: 28 },
+      { id: 2, count: 0 },
+      { id: 3, count: 0 },
+    ],
     cards: [
       {
         guid: 10_001,
@@ -85,6 +94,7 @@ describe("game protocol", () => {
         })),
       },
     ],
+    levels: [{ id: 65_793, star: 15 }],
   };
 
   it("round-trips the packet header", () => {
@@ -124,9 +134,13 @@ describe("game protocol", () => {
         registerTime: 1,
         lastLoginAt: null,
         taskValues: {},
+        items: [],
+        nextItemGuid: 20_001,
+        money: [],
         cards: [],
         girls: [],
         formations: [],
+        levels: [],
       },
       {
         id: 1,
@@ -152,9 +166,13 @@ describe("game protocol", () => {
         registerTime: 1,
         lastLoginAt: "2026-07-28T00:00:00.000Z",
         taskValues: {},
+        items: [],
+        nextItemGuid: 20_001,
+        money: [],
         cards: [],
         girls: [],
         formations: [],
+        levels: [],
       },
       {
         id: 1,
@@ -203,6 +221,27 @@ describe("game protocol", () => {
     );
     expect(firstNumber(formation, 1)).toBe(1);
     expect(formation.filter((field) => field.fieldNumber === 2)).toHaveLength(3);
+
+    const levelList = decodeFields(
+      fields.find((field) => field.fieldNumber === 12)?.value as Buffer,
+    );
+    const firstLevel = decodeFields(levelList[0]?.value as Buffer);
+    expect(firstNumber(firstLevel, 1)).toBe(65_793);
+    expect(firstNumber(firstLevel, 2)).toBe(15);
+
+    const money = fields
+      .filter((field) => field.fieldNumber === 5)
+      .map((field) => decodeFields(field.value as Buffer));
+    expect(
+      money.map((entry) => [
+        firstNumber(entry, 1),
+        firstNumber(entry, 2),
+      ]),
+    ).toEqual([
+      [1, 28],
+      [2, 0],
+      [3, 0],
+    ]);
   });
 
   it("encodes the three starter character cards in ItemNtf", () => {
@@ -233,5 +272,27 @@ describe("game protocol", () => {
     const formation = decodeFields(fields[0]?.value as Buffer);
     expect(firstNumber(formation, 1)).toBe(1);
     expect(formation.filter((field) => field.fieldNumber === 2)).toHaveLength(3);
+  });
+
+  it("encodes incremental item and money notifications", () => {
+    const item = {
+      ...rosterPlayer.cards[0]!,
+      guid: 20_001,
+      genre: 7,
+      detail: 1,
+      particular: 4,
+      count: 2,
+    };
+    const itemFields = decodeFields(makeItemUpdateNotification([item]));
+    const encodedItem = decodeFields(itemFields[0]?.value as Buffer);
+    expect(firstNumber(encodedItem, 1)).toBe(20_001);
+    expect(firstNumber(encodedItem, 6)).toBe(2);
+
+    const moneyFields = decodeFields(
+      makeMoneyUpdateNotification({ id: 1, count: 25 }),
+    );
+    const encodedMoney = decodeFields(moneyFields[0]?.value as Buffer);
+    expect(firstNumber(encodedMoney, 1)).toBe(1);
+    expect(firstNumber(encodedMoney, 2)).toBe(25);
   });
 });

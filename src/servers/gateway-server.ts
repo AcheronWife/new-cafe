@@ -1,17 +1,28 @@
 import { createServer, type Server, type Socket } from "node:net";
 
 import type { AppConfig } from "../config.js";
+import {
+  ChapterCatalog,
+  effectiveEnergyCost,
+  rollChapterAwards,
+  type ChapterLevelConfig,
+} from "../game-data/chapter-config.js";
 import type { Logger } from "../logger.js";
-import type {
-  FormationState,
-  Player,
-  PlayerRepository,
+import {
+  InsufficientVigourError,
+  makeLevelId,
+  MONEY_VIGOUR,
+  type FormationState,
+  type Player,
+  type PlayerRepository,
 } from "../persistence/player-repository.js";
 import { COMMAND, commandName } from "../protocol/commands.js";
 import {
   makePlayerNotification,
   makeItemNotification,
+  makeItemUpdateNotification,
   makeFormationUpdateNotification,
+  makeMoneyUpdateNotification,
   makeServerLuaCall,
   makeTaskValueSync,
   makeVerifyResponse,
@@ -31,6 +42,15 @@ interface ConnectionContext {
   account: string;
   player: Player | null;
   isNewPlayer: boolean;
+  activeChapter: {
+    level: ChapterLevelConfig;
+    firstClear: boolean;
+    passCount: number;
+  } | null;
+  lastSettlement: {
+    key: string;
+    response: Record<string, unknown>;
+  } | null;
 }
 
 interface HexPreview {
@@ -181,12 +201,16 @@ export function createGatewayServer({
   logger,
   players,
 }: GatewayServerOptions): Server {
+  const chapterCatalog = ChapterCatalog.loadDefault();
+  logger.info("game_data.chapter.loaded", { levels: chapterCatalog.size });
   return createServer((socket) => {
     const peer = peerName(socket);
     const context: ConnectionContext = {
       account: "offline",
       player: null,
       isNewPlayer: false,
+      activeChapter: null,
+      lastSettlement: null,
     };
     let pending = Buffer.alloc(0);
     let receiveQueue: Promise<void> = Promise.resolve();
@@ -340,6 +364,75 @@ export function createGatewayServer({
         } else {
           const chapterCall = parseChapterCall(call);
           if (chapterCall?.state === 0) {
+            const chapter = Number(chapterCall.parameters.Chapter);
+            const index = Number(chapterCall.parameters.Index);
+            const difficulty = Number(chapterCall.parameters.Difficult);
+            const level = chapterCatalog.get(chapter, index, difficulty);
+            if (!level) {
+              logger.warn("chapter.level.missing", {
+                account: context.account,
+                chapter,
+                index,
+                difficulty,
+              });
+              send(
+                COMMAND.NTF_S2C_CALL,
+                0,
+                makeServerLuaCall("ChapterMsg", {
+                  nError: 1,
+                  nState: 0,
+                }),
+              );
+              return;
+            }
+
+            const player =
+              context.player ?? (await players.getOrCreate(context.account));
+            const levelId = makeLevelId(chapter, index, difficulty);
+            const previous = player.levels.find(({ id }) => id === levelId);
+            const passCount = (previous?.star ?? 0) >>> 3;
+            const energyCost = effectiveEnergyCost(level, player.level);
+            try {
+              context.player = await players.enterLevel(
+                context.account,
+                energyCost,
+              );
+            } catch (error) {
+              if (!(error instanceof InsufficientVigourError)) throw error;
+              logger.info("chapter.enter.insufficient_vigour", {
+                account: context.account,
+                chapter,
+                index,
+                difficulty,
+                required: error.required,
+                available: error.available,
+              });
+              send(
+                COMMAND.NTF_S2C_CALL,
+                0,
+                makeServerLuaCall("ChapterMsg", {
+                  nError: 20014,
+                  nState: 0,
+                }),
+              );
+              return;
+            }
+            context.activeChapter = {
+              level,
+              firstClear: passCount === 0,
+              passCount,
+            };
+            context.lastSettlement = null;
+            const vigour = context.player.money.find(
+              ({ id }) => id === MONEY_VIGOUR,
+            );
+            if (vigour) {
+              send(
+                COMMAND.MONEY_UPDATE_NTF,
+                0,
+                makeMoneyUpdateNotification(vigour),
+              );
+            }
             send(
               COMMAND.NTF_S2C_CALL,
               0,
@@ -355,27 +448,112 @@ export function createGatewayServer({
               account: context.account,
               method: "ChapterMsg",
               command: "enter",
+              chapter,
+              index,
+              difficulty,
+              energyCost,
+              remainingVigour: vigour?.count ?? 0,
             });
           } else if (chapterCall?.state === 1) {
+            const chapter = Number(chapterCall.parameters.Chapter);
+            const index = Number(chapterCall.parameters.Index);
+            const difficulty = Number(chapterCall.parameters.Difficult);
+            const star = Number(chapterCall.parameters.nStar) || 0;
+            const settlementKey = `${chapter}:${index}:${difficulty}:${star}`;
+            if (context.lastSettlement?.key === settlementKey) {
+              send(
+                COMMAND.NTF_S2C_CALL,
+                0,
+                makeServerLuaCall("ChapterMsg", context.lastSettlement.response),
+              );
+              return;
+            }
+
+            let completedStar = star;
+            let awards: ReturnType<typeof rollChapterAwards> = [];
+            let masterExp = 0;
+            let cardExp = 0;
+            if (star > 0) {
+              const level =
+                context.activeChapter?.level ??
+                chapterCatalog.get(chapter, index, difficulty);
+              if (!level) {
+                throw new Error(
+                  `Missing chapter config ${chapter}:${index}:${difficulty}`,
+                );
+              }
+              const currentPlayer =
+                context.player ?? (await players.getOrCreate(context.account));
+              const levelId = makeLevelId(chapter, index, difficulty);
+              const previous = currentPlayer.levels.find(({ id }) => id === levelId);
+              const passCount =
+                context.activeChapter?.passCount ?? ((previous?.star ?? 0) >>> 3);
+              const firstClear =
+                context.activeChapter?.firstClear ?? passCount === 0;
+              awards = rollChapterAwards(
+                level,
+                firstClear,
+                `${context.account}:${levelId}:${passCount}`,
+              );
+              masterExp = level.masterExp;
+              cardExp = level.cardExp;
+              const settlement = await players.settleLevel(
+                context.account,
+                chapter,
+                index,
+                difficulty,
+                star,
+                awards,
+                masterExp,
+              );
+              context.player = settlement.player;
+              completedStar =
+                context.player.levels.find(
+                  ({ id }) => id === makeLevelId(chapter, index, difficulty),
+                )?.star ?? star;
+              for (const money of settlement.updatedMoney) {
+                send(
+                  COMMAND.MONEY_UPDATE_NTF,
+                  0,
+                  makeMoneyUpdateNotification(money),
+                );
+              }
+              if (settlement.updatedItems.length > 0) {
+                send(
+                  COMMAND.ITEM_UPDATE_NTF,
+                  0,
+                  makeItemUpdateNotification(settlement.updatedItems),
+                );
+              }
+            }
+            const response = {
+              nError: 0,
+              nState: 1,
+              nStar: completedStar,
+              tbAwards: awards,
+              tbExp: {
+                MasterExp: masterExp,
+                CardExp: cardExp,
+              },
+            };
+            context.lastSettlement = { key: settlementKey, response };
             send(
               COMMAND.NTF_S2C_CALL,
               0,
-              makeServerLuaCall("ChapterMsg", {
-                nError: 0,
-                nState: 1,
-                nStar: Number(chapterCall.parameters.nStar) || 0,
-                tbAwards: [],
-                tbExp: {
-                  MasterExp: 0,
-                  CardExp: 0,
-                },
-              }),
+              makeServerLuaCall("ChapterMsg", response),
             );
             logger.info("lua.callback", {
               peer,
               account: context.account,
               method: "ChapterMsg",
               command: "settlement",
+              chapter,
+              index,
+              difficulty,
+              firstClear: context.activeChapter?.firstClear ?? false,
+              awards,
+              masterExp,
+              cardExp,
             });
           } else if (isHeadTouchedCall(call)) {
             send(

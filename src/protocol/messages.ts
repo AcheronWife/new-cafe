@@ -12,6 +12,9 @@ import type {
   FightCardState,
   FormationState,
   GirlState,
+  InventoryItemState,
+  LevelState,
+  MoneyState,
   Player,
   TaskChange,
 } from "../persistence/player-repository.js";
@@ -52,6 +55,7 @@ export function makePlayerNotification(player: Player): Buffer {
     fieldVarint(2, player.level),
     fieldVarint(3, player.exp),
     fieldVarint(4, player.fightPower),
+    ...player.money.map((money) => fieldBytes(5, makeMoneyInfo(money))),
     fieldVarint(6, player.registerTime),
     fieldVarint(7, now),
     fieldVarint(8, now),
@@ -60,7 +64,7 @@ export function makePlayerNotification(player: Player): Buffer {
     ...player.formations.map((formation) =>
       fieldBytes(11, makeFormationInfo(formation)),
     ),
-    fieldBytes(12, Buffer.alloc(0)),
+    fieldBytes(12, makeLevelList(player.levels)),
     fieldVarint(20, player.roleId),
   ]);
 }
@@ -99,30 +103,56 @@ function makeFormationInfo(formation: FormationState): Buffer {
   ]);
 }
 
+function makeLevel(level: LevelState): Buffer {
+  return Buffer.concat([fieldVarint(1, level.id), fieldVarint(2, level.star)]);
+}
+
+function makeLevelList(levels: readonly LevelState[]): Buffer {
+  return Buffer.concat(levels.map((level) => fieldBytes(1, makeLevel(level))));
+}
+
 export function makeFormationUpdateNotification(formation: FormationState): Buffer {
   return fieldBytes(1, makeFormationInfo(formation));
 }
 
-function makeItemInfo(card: CharacterCardState): Buffer {
+function makeItemInfo(item: CharacterCardState | InventoryItemState): Buffer {
   return Buffer.concat([
-    fieldVarint(1, card.guid),
-    fieldVarint(2, card.genre),
-    fieldVarint(3, card.detail),
-    fieldVarint(4, card.particular),
-    fieldVarint(5, card.templateLevel),
-    fieldVarint(6, card.count),
-    fieldVarint(7, card.createTime),
-    fieldVarint(8, card.enhanceLevel),
-    fieldVarint(9, card.enhanceExp),
-    fieldVarint(10, card.breakLevel),
+    fieldVarint(1, item.guid),
+    fieldVarint(2, item.genre),
+    fieldVarint(3, item.detail),
+    fieldVarint(4, item.particular),
+    fieldVarint(5, item.templateLevel),
+    fieldVarint(6, item.count),
+    fieldVarint(7, item.createTime),
+    fieldVarint(8, item.enhanceLevel),
+    fieldVarint(9, item.enhanceExp),
+    fieldVarint(10, item.breakLevel),
   ]);
 }
 
 export function makeItemNotification(player: Player): Buffer {
+  const items = [...player.cards, ...player.items];
   return Buffer.concat([
-    ...player.cards.map((card) => fieldBytes(1, makeItemInfo(card))),
-    fieldVarint(2, player.cards.length),
+    ...items.map((item) => fieldBytes(1, makeItemInfo(item))),
+    fieldVarint(2, items.length),
   ]);
+}
+
+export function makeItemUpdateNotification(
+  items: readonly InventoryItemState[],
+): Buffer {
+  return Buffer.concat(items.map((item) => fieldBytes(1, makeItemInfo(item))));
+}
+
+function makeMoneyInfo(money: MoneyState): Buffer {
+  return Buffer.concat([
+    fieldVarint(1, money.id),
+    fieldVarint(2, money.count),
+  ]);
+}
+
+export function makeMoneyUpdateNotification(money: MoneyState): Buffer {
+  return fieldBytes(1, makeMoneyInfo(money));
 }
 
 export function makeTaskValueSync(
