@@ -28,11 +28,11 @@
     "file": "data/state.json"
   },
   "playerDefaults": {
-    "name": "offline",
+    "name": "",
     "level": 1,
     "exp": 0,
     "fightPower": 0,
     "serverZone": 8,
-    "firstLevelComplete": true
+    "firstLevelComplete": false
   }
 }

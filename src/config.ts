@@ -33,7 +33,7 @@ const configSchema = z.object({
     file: z.string().min(1),
   }),
   playerDefaults: z.object({
-    name: z.string().min(1),
+    name: z.string(),
     level: z.number().int().positive(),
     exp: z.number().int().nonnegative(),
     fightPower: z.number().int().nonnegative(),
