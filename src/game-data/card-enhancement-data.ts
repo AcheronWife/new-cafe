@@ -22,16 +22,18 @@ export interface ExpMaterialDefinition {
 }
 
 const EXP_CARD_PARTICULARS = [1, 2, 3, 5, 6, 4] as const;
-const EXP_CARD_EXPERIENCE = [150, 750, 3_750, 18_750] as const;
+const EXP_CARD_BASE_EXPERIENCE = [500, 2_500, 10_000, 50_000] as const;
+const CLIENT_SELECTABLE_EXP_RATE = 1.5;
 
 /**
- * Mirrors CardCommon.tbExpCard. The original client applies a 1.5 multiplier
- * to same-attribute and generic materials. The first implementation uses that
- * effective value for all six materials in each tier; this is exact for the
- * material observed in guide 110 and deliberately permissive for offline play.
+ * Mirrors ItemList.asset ExtParam1 and CardCommon:GetItemExp().
+ *
+ * The shipped UI only exposes same-attribute and generic experience materials.
+ * Both use CardCommon.SameAttrEXPRate (1.5), so these are the exact experience
+ * values shown in the client before it sends Card_LevelUpCommon.
  */
 export const CARD_EXP_MATERIALS: ReadonlyMap<number, ExpMaterialDefinition> = new Map(
-  EXP_CARD_EXPERIENCE.flatMap((experience, tierIndex) =>
+  EXP_CARD_BASE_EXPERIENCE.flatMap((baseExperience, tierIndex) =>
     EXP_CARD_PARTICULARS.map((particular, particularIndex) => [
       tierIndex * EXP_CARD_PARTICULARS.length + particularIndex + 1,
       {
@@ -39,7 +41,7 @@ export const CARD_EXP_MATERIALS: ReadonlyMap<number, ExpMaterialDefinition> = ne
         detail: 1,
         particular,
         templateLevel: tierIndex + 1,
-        experience,
+        experience: Math.floor(baseExperience * CLIENT_SELECTABLE_EXP_RATE),
       },
     ]),
   ),

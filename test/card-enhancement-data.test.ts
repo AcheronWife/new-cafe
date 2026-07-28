@@ -48,18 +48,23 @@ describe("card enhancement data", () => {
       detail: 1,
       particular: 1,
       templateLevel: 1,
-      experience: 150,
+      experience: 750,
     });
     expect(CARD_EXP_MATERIALS.get(6)).toMatchObject({
       particular: 4,
       templateLevel: 1,
     });
+    expect(CARD_EXP_MATERIALS.get(12)).toMatchObject({
+      particular: 4,
+      templateLevel: 2,
+      experience: 3_750,
+    });
   });
 
   it("carries experience across card levels", () => {
-    expect(addCardExperience(1, 0, 150)).toEqual({
-      level: 2,
-      experience: 17,
+    expect(addCardExperience(1, 0, 750)).toEqual({
+      level: 4,
+      experience: 167,
     });
   });
 });

@@ -109,6 +109,7 @@ it("persists player and task changes atomically", async () => {
     ]);
     const awardedCards = settlement.updatedItems.filter(({ genre }) => genre === 1);
     expect(awardedCards).toHaveLength(2);
+    expect(awardedCards.every(({ enhanceLevel }) => enhanceLevel === 1)).toBe(true);
     expect(new Set(awardedCards.map(({ guid }) => guid)).size).toBe(2);
     const awardedCard = settlement.updatedItems.find(({ genre }) => genre === 1);
     expect(awardedCard).toBeDefined();
@@ -133,8 +134,8 @@ it("persists player and task changes atomically", async () => {
     ]);
     expect(enhancement.card).toMatchObject({
       guid: 10_003,
-      enhanceLevel: 2,
-      enhanceExp: 17,
+      enhanceLevel: 4,
+      enhanceExp: 167,
     });
     expect(enhancement.consumedItems).toMatchObject([
       { genre: 7, detail: 1, particular: 4, templateLevel: 1, count: 1 },
@@ -185,8 +186,8 @@ it("persists player and task changes atomically", async () => {
       ),
     ).toMatchObject({
       guid: 10_003,
-      enhanceLevel: 2,
-      enhanceExp: 17,
+      enhanceLevel: 4,
+      enhanceExp: 167,
     });
 
     const legacyPlayer = persisted.players.tester;
@@ -224,8 +225,8 @@ it("persists player and task changes atomically", async () => {
     );
     expect(migratedPlayer.inventory.find(({ guid }) => guid === 10_003)).toMatchObject({
       genre: 1,
-      enhanceLevel: 2,
-      enhanceExp: 17,
+      enhanceLevel: 4,
+      enhanceExp: 167,
     });
     const migratedDocument = JSON.parse(await readFile(filePath, "utf8"));
     expect(migratedDocument.schemaVersion).toBe(9);

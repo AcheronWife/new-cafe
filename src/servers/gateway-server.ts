@@ -28,6 +28,7 @@ import {
   LUA_COMMAND_WRITE_GUIDE_LOG,
   makeGuideLogAcknowledgement,
 } from "../game-data/guide-data.js";
+import { EIGHT_DAY_SIGN_UP_ACTIVITY_ID } from "../game-data/eight-day-sign-up-data.js";
 import { GachaCatalog, type GachaRollResult } from "../game-data/gacha-data.js";
 import {
   LUA_COMMAND_SHOP_GOODS_LIST,
@@ -41,6 +42,7 @@ import type { Logger } from "../logger.js";
 import {
   InsufficientVigourError,
   InsufficientGachaCurrencyError,
+  EightDaySignUpError,
   isCharacterCard,
   makeGachaTaskId,
   makeLevelId,
@@ -478,6 +480,73 @@ export function createGatewayServer({
             award: result.award,
           });
           return;
+        }
+        if (call?.method === "NormalActivityGetAward") {
+          const parameters =
+            call.parameters && typeof call.parameters === "object"
+              ? (call.parameters as Record<string, unknown>)
+              : {};
+          const activityId = Number(parameters.nActivityId);
+          const achievementId = Number(parameters.nId);
+          if (activityId === EIGHT_DAY_SIGN_UP_ACTIVITY_ID) {
+            try {
+              const result = await players.claimEightDaySignUpAward(
+                context.account,
+                achievementId,
+              );
+              context.player = result.player;
+              send(
+                COMMAND.TASK_VALUE_RSP,
+                0,
+                makeTaskValueSync(result.player.taskValues),
+              );
+              if (result.updatedItems.length > 0) {
+                send(
+                  COMMAND.ITEM_UPDATE_NTF,
+                  0,
+                  makeItemUpdateNotification(result.updatedItems),
+                );
+              }
+              for (const money of result.updatedMoney) {
+                send(COMMAND.MONEY_UPDATE_NTF, 0, makeMoneyUpdateNotification(money));
+              }
+              send(
+                COMMAND.NTF_S2C_CALL,
+                0,
+                makeServerLuaCall("MissionMgrMsg", {
+                  nError: 0,
+                  nMission: 0,
+                }),
+              );
+              logger.info("lua.callback", {
+                peer,
+                account: context.account,
+                method: "MissionMgrMsg",
+                feature: "eight_day_sign_up.award",
+                activityId,
+                achievementId,
+                awards: result.awards,
+              });
+            } catch (error) {
+              if (!(error instanceof EightDaySignUpError)) throw error;
+              send(
+                COMMAND.NTF_S2C_CALL,
+                0,
+                makeServerLuaCall("MissionMgrMsg", {
+                  nError: 1,
+                  nMission: 0,
+                }),
+              );
+              logger.warn("eight_day_sign_up.claim_rejected", {
+                peer,
+                account: context.account,
+                activityId,
+                achievementId,
+                reason: error.reason,
+              });
+            }
+            return;
+          }
         }
         if (call?.method === "Lottery" || call?.method === "GetFirstGacha") {
           const parameters =

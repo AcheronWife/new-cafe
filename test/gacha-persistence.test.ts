@@ -70,6 +70,11 @@ it("atomically consumes a ticket and persists gacha rewards and counters", async
     ).toBe(0);
     expect(result.updatedItems.filter(({ genre }) => genre === 1)).toHaveLength(10);
     expect(
+      result.updatedItems
+        .filter(({ genre }) => genre === 1)
+        .every(({ enhanceLevel }) => enhanceLevel === 1),
+    ).toBe(true);
+    expect(
       result.player.inventory.find(
         ({ genre, detail, particular, templateLevel }) =>
           genre === 7 && detail === 1 && particular === 4 && templateLevel === 2,

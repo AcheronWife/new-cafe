@@ -5,7 +5,7 @@ import {
   type CardEnhancementMaterial,
 } from "../game-data/card-enhancement-data.js";
 import { INITIAL_COFFEE_TASK_VALUES, type CafeCoffee } from "../game-data/cafe-data.js";
-import type { Award } from "../game-data/chapter-config.js";
+import type { Award, BaseAward } from "../game-data/chapter-config.js";
 import {
   dailySignUpOperationalDate,
   dailySignUpReward,
@@ -13,6 +13,14 @@ import {
   DAILY_SIGN_UP_TODAY_TASK,
   DAILY_SIGN_UP_TOTAL_TASK,
 } from "../game-data/daily-sign-up-data.js";
+import {
+  EIGHT_DAY_SIGN_UP_REWARDS,
+  eightDaySignUpProgress,
+  eightDaySignUpReward,
+  hasClaimedEightDaySignUpReward,
+  makeEightDaySignUpTaskId,
+  makeEightDaySignUpTaskValue,
+} from "../game-data/eight-day-sign-up-data.js";
 import type {
   GachaAward,
   GachaPool,
@@ -128,6 +136,11 @@ export interface DailySignUpState {
   lastOperationalDate: string | null;
 }
 
+export interface EightDaySignUpState {
+  cumulativeDays: number;
+  lastOperationalDate: string | null;
+}
+
 export interface Player {
   account: string;
   roleId: number;
@@ -149,6 +162,7 @@ export interface Player {
   phone: PhoneState;
   gacha?: GachaState;
   dailySignUp?: DailySignUpState;
+  eightDaySignUp?: EightDaySignUpState;
 }
 
 export interface PersistedState {
@@ -193,6 +207,14 @@ export interface DailySignUpResult {
   updatedMoney: MoneyState[];
 }
 
+export interface EightDaySignUpAwardResult {
+  player: Player;
+  achievementId: number;
+  awards: readonly BaseAward[];
+  updatedItems: InventoryItemState[];
+  updatedMoney: MoneyState[];
+}
+
 export class InsufficientVigourError extends Error {
   constructor(
     readonly required: number,
@@ -207,6 +229,15 @@ export class InsufficientGachaCurrencyError extends Error {
   constructor(readonly poolId: number) {
     super(`Insufficient currency for gacha pool ${poolId}`);
     this.name = "InsufficientGachaCurrencyError";
+  }
+}
+
+export class EightDaySignUpError extends Error {
+  constructor(
+    readonly reason: "unknown_achievement" | "not_completed" | "already_claimed",
+  ) {
+    super(`Eight-day sign-up error: ${reason}`);
+    this.name = "EightDaySignUpError";
   }
 }
 
@@ -254,6 +285,44 @@ function reconcileDailySignUp(player: Player, now = Date.now()): void {
     player.taskValues[todayTaskId] = 0;
   } else if (player.dailySignUp.lastOperationalDate !== operationalDate) {
     player.taskValues[todayTaskId] = 0;
+  }
+}
+
+function reconcileEightDaySignUp(
+  player: Player,
+  now = Date.now(),
+  recordLogin = false,
+): void {
+  const existingProgress = Math.max(
+    0,
+    ...EIGHT_DAY_SIGN_UP_REWARDS.map(({ achievementId }) =>
+      eightDaySignUpProgress(
+        player.taskValues[String(makeEightDaySignUpTaskId(achievementId))] ?? 0,
+      ),
+    ),
+  );
+  player.eightDaySignUp ??= {
+    cumulativeDays: Math.min(8, existingProgress),
+    lastOperationalDate: null,
+  };
+
+  const operationalDate = dailySignUpOperationalDate(now);
+  if (recordLogin && player.eightDaySignUp.lastOperationalDate !== operationalDate) {
+    player.eightDaySignUp.cumulativeDays = Math.min(
+      8,
+      player.eightDaySignUp.cumulativeDays + 1,
+    );
+    player.eightDaySignUp.lastOperationalDate = operationalDate;
+  }
+
+  for (const { achievementId } of EIGHT_DAY_SIGN_UP_REWARDS) {
+    const taskId = String(makeEightDaySignUpTaskId(achievementId));
+    const current = player.taskValues[taskId] ?? 0;
+    if (player.eightDaySignUp.cumulativeDays === 0 && current === 0) continue;
+    player.taskValues[taskId] = makeEightDaySignUpTaskValue(
+      player.eightDaySignUp.cumulativeDays,
+      hasClaimedEightDaySignUpReward(current),
+    );
   }
 }
 
@@ -331,6 +400,19 @@ function migrateInventoryState(player: Player): void {
   player.nextItemGuid = Math.max(nextGuid, player.nextItemGuid);
   delete legacy.cards;
   delete legacy.items;
+}
+
+// Unity character-card instances are born at Level 1, including reward and gacha cards.
+function reconcileCharacterCardLevels(player: Player): void {
+  for (const entry of player.inventory) {
+    if (isCharacterCard(entry) && entry.enhanceLevel < 1) {
+      entry.enhanceLevel = 1;
+    }
+  }
+}
+
+function initialEnhanceLevel(genre: number): number {
+  return genre === 1 ? 1 : 0;
 }
 
 function makeStarterRoster(
@@ -425,7 +507,7 @@ function addInventoryAward(
         templateLevel,
         count: 1,
         createTime: unixTime(),
-        enhanceLevel: 0,
+        enhanceLevel: initialEnhanceLevel(genre),
         enhanceExp: 0,
         breakLevel: 0,
       };
@@ -460,6 +542,41 @@ function addInventoryAward(
   }
   item.count += count;
   updatedItemGuids.add(item.guid);
+}
+
+function grantAwards(
+  player: Player,
+  awards: readonly BaseAward[],
+  updatedItemGuids: Set<number>,
+  updatedMoneyIds: Set<number>,
+): void {
+  for (const [genre, detail, particular, templateLevel, rawCount] of awards) {
+    const count = Math.max(0, rawCount);
+    if (count === 0) continue;
+
+    const moneyId =
+      genre === 15 && detail === 1
+        ? MONEY_GOLD
+        : genre === 15 && detail === 2
+          ? MONEY_DIAMOND
+          : null;
+    if (moneyId !== null) {
+      let money = player.money.find(({ id }) => id === moneyId);
+      if (!money) {
+        money = { id: moneyId, count: 0 };
+        player.money.push(money);
+      }
+      money.count += count;
+      updatedMoneyIds.add(moneyId);
+      continue;
+    }
+
+    addInventoryAward(
+      player,
+      [genre, detail, particular, templateLevel, count],
+      updatedItemGuids,
+    );
+  }
 }
 
 function deductGachaCost(
@@ -545,7 +662,9 @@ export class PlayerRepository {
         player.cafe ??= makeInitialCafeState();
         player.phone ??= migratePhoneState(player);
         player.gacha ??= makeInitialGachaState();
+        reconcileCharacterCardLevels(player);
         reconcileDailySignUp(player);
+        reconcileEightDaySignUp(player);
         state.schemaVersion = 9;
         return;
       }
@@ -579,6 +698,7 @@ export class PlayerRepository {
         dailySignUp: makeInitialDailySignUpState(),
         ...makeStarterRoster(registerTime),
       };
+      reconcileEightDaySignUp(player);
       state.schemaVersion = 9;
       state.players[safeAccount] = player;
       this.#logger.info("player.created", { account: safeAccount, roleId });
@@ -591,13 +711,14 @@ export class PlayerRepository {
     return this.#store.snapshot().players?.[account] ?? null;
   }
 
-  async markLogin(account: string): Promise<Player> {
+  async markLogin(account: string, now = Date.now()): Promise<Player> {
     let player: Player | undefined;
     await this.#store.update((state) => {
       player = state.players[account];
       if (!player) throw new Error(`Unknown player account: ${account}`);
-      reconcileDailySignUp(player);
-      player.lastLoginAt = new Date().toISOString();
+      reconcileDailySignUp(player, now);
+      reconcileEightDaySignUp(player, now, true);
+      player.lastLoginAt = new Date(now).toISOString();
     });
     if (!player) throw new Error(`Failed to mark player login: ${account}`);
     return structuredClone(player);
@@ -707,6 +828,55 @@ export class PlayerRepository {
       award,
       fresh,
       cumulativeCount,
+      updatedItems: snapshot.inventory.filter(({ guid }) => updatedItemGuids.has(guid)),
+      updatedMoney: snapshot.money.filter(({ id }) => updatedMoneyIds.has(id)),
+    };
+  }
+
+  async claimEightDaySignUpAward(
+    account: string,
+    achievementId: number,
+  ): Promise<EightDaySignUpAwardResult> {
+    const reward = eightDaySignUpReward(achievementId);
+    if (!reward) throw new EightDaySignUpError("unknown_achievement");
+
+    let player: Player | undefined;
+    const updatedItemGuids = new Set<number>();
+    const updatedMoneyIds = new Set<number>();
+    await this.#store.update((state) => {
+      player = state.players[account];
+      if (!player) throw new Error(`Unknown player account: ${account}`);
+      reconcileEightDaySignUp(player);
+
+      const taskId = String(makeEightDaySignUpTaskId(achievementId));
+      const taskValue = player.taskValues[taskId] ?? 0;
+      if (hasClaimedEightDaySignUpReward(taskValue)) {
+        throw new EightDaySignUpError("already_claimed");
+      }
+      if (eightDaySignUpProgress(taskValue) < reward.requiredDays) {
+        throw new EightDaySignUpError("not_completed");
+      }
+
+      player.taskValues[taskId] = makeEightDaySignUpTaskValue(
+        eightDaySignUpProgress(taskValue),
+        true,
+      );
+      grantAwards(player, reward.awards, updatedItemGuids, updatedMoneyIds);
+      state.schemaVersion = 9;
+    });
+    if (!player) {
+      throw new Error(`Failed to claim eight-day sign-up award: ${account}`);
+    }
+    const snapshot = structuredClone(player);
+    this.#logger.info("player.eight_day_sign_up.claimed", {
+      account,
+      achievementId,
+      awards: reward.awards,
+    });
+    return {
+      player: snapshot,
+      achievementId,
+      awards: reward.awards,
       updatedItems: snapshot.inventory.filter(({ guid }) => updatedItemGuids.has(guid)),
       updatedMoney: snapshot.money.filter(({ id }) => updatedMoneyIds.has(id)),
     };
@@ -1161,7 +1331,7 @@ export class PlayerRepository {
               templateLevel,
               count: 1,
               createTime: unixTime(),
-              enhanceLevel: 0,
+              enhanceLevel: initialEnhanceLevel(genre),
               enhanceExp: 0,
               breakLevel: 0,
             };
