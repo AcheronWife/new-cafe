@@ -6,6 +6,13 @@ import {
 } from "../game-data/card-enhancement-data.js";
 import { INITIAL_COFFEE_TASK_VALUES, type CafeCoffee } from "../game-data/cafe-data.js";
 import type { Award } from "../game-data/chapter-config.js";
+import {
+  dailySignUpOperationalDate,
+  dailySignUpReward,
+  makeDailySignUpTaskId,
+  DAILY_SIGN_UP_TODAY_TASK,
+  DAILY_SIGN_UP_TOTAL_TASK,
+} from "../game-data/daily-sign-up-data.js";
 import type {
   GachaAward,
   GachaPool,
@@ -116,6 +123,11 @@ export interface GachaState {
   pending: PendingGachaState | null;
 }
 
+export interface DailySignUpState {
+  cycle: string;
+  lastOperationalDate: string | null;
+}
+
 export interface Player {
   account: string;
   roleId: number;
@@ -136,10 +148,11 @@ export interface Player {
   cafe: CafeState;
   phone: PhoneState;
   gacha?: GachaState;
+  dailySignUp?: DailySignUpState;
 }
 
 export interface PersistedState {
-  schemaVersion: 8;
+  schemaVersion: 9;
   nextRoleId: number;
   players: Record<string, Player>;
   updatedAt: string | null;
@@ -169,6 +182,15 @@ export interface GachaCommitResult {
   updatedItems: InventoryItemState[];
   updatedMoney: MoneyState[];
   getItem: Gdpln | null;
+}
+
+export interface DailySignUpResult {
+  player: Player;
+  award: readonly [number, number, number, number, number] | null;
+  fresh: boolean;
+  cumulativeCount: number;
+  updatedItems: InventoryItemState[];
+  updatedMoney: MoneyState[];
 }
 
 export class InsufficientVigourError extends Error {
@@ -208,6 +230,31 @@ function makeInitialPhoneState(): PhoneState {
 
 function makeInitialGachaState(): GachaState {
   return { pending: null };
+}
+
+function makeInitialDailySignUpState(now = Date.now()): DailySignUpState {
+  const operationalDate = dailySignUpOperationalDate(now);
+  return {
+    cycle: operationalDate.slice(0, 7),
+    lastOperationalDate: null,
+  };
+}
+
+function reconcileDailySignUp(player: Player, now = Date.now()): void {
+  const operationalDate = dailySignUpOperationalDate(now);
+  const cycle = operationalDate.slice(0, 7);
+  const todayTaskId = String(makeDailySignUpTaskId(DAILY_SIGN_UP_TODAY_TASK));
+  const totalTaskId = String(makeDailySignUpTaskId(DAILY_SIGN_UP_TOTAL_TASK));
+  player.dailySignUp ??= makeInitialDailySignUpState(now);
+
+  if (player.dailySignUp.cycle !== cycle) {
+    player.dailySignUp.cycle = cycle;
+    player.dailySignUp.lastOperationalDate = null;
+    player.taskValues[totalTaskId] = 0;
+    player.taskValues[todayTaskId] = 0;
+  } else if (player.dailySignUp.lastOperationalDate !== operationalDate) {
+    player.taskValues[todayTaskId] = 0;
+  }
 }
 
 function hasCompletedLevel(
@@ -498,7 +545,8 @@ export class PlayerRepository {
         player.cafe ??= makeInitialCafeState();
         player.phone ??= migratePhoneState(player);
         player.gacha ??= makeInitialGachaState();
-        state.schemaVersion = 8;
+        reconcileDailySignUp(player);
+        state.schemaVersion = 9;
         return;
       }
 
@@ -528,9 +576,10 @@ export class PlayerRepository {
         cafe: makeInitialCafeState(),
         phone: makeInitialPhoneState(),
         gacha: makeInitialGachaState(),
+        dailySignUp: makeInitialDailySignUpState(),
         ...makeStarterRoster(registerTime),
       };
-      state.schemaVersion = 8;
+      state.schemaVersion = 9;
       state.players[safeAccount] = player;
       this.#logger.info("player.created", { account: safeAccount, roleId });
     });
@@ -547,6 +596,7 @@ export class PlayerRepository {
     await this.#store.update((state) => {
       player = state.players[account];
       if (!player) throw new Error(`Unknown player account: ${account}`);
+      reconcileDailySignUp(player);
       player.lastLoginAt = new Date().toISOString();
     });
     if (!player) throw new Error(`Failed to mark player login: ${account}`);
@@ -584,6 +634,84 @@ export class PlayerRepository {
     return structuredClone(player);
   }
 
+  async signUpDaily(account: string, now = Date.now()): Promise<DailySignUpResult> {
+    let player: Player | undefined;
+    let award: readonly [number, number, number, number, number] | null = null;
+    let fresh = false;
+    let cumulativeCount = 0;
+    const updatedItemGuids = new Set<number>();
+    const updatedMoneyIds = new Set<number>();
+    await this.#store.update((state) => {
+      player = state.players[account];
+      if (!player) throw new Error(`Unknown player account: ${account}`);
+      reconcileDailySignUp(player, now);
+
+      const operationalDate = dailySignUpOperationalDate(now);
+      const todayTaskId = String(makeDailySignUpTaskId(DAILY_SIGN_UP_TODAY_TASK));
+      const totalTaskId = String(makeDailySignUpTaskId(DAILY_SIGN_UP_TOTAL_TASK));
+      cumulativeCount = Math.max(0, player.taskValues[totalTaskId] ?? 0);
+      if (
+        player.dailySignUp?.lastOperationalDate === operationalDate ||
+        player.taskValues[todayTaskId] === 1
+      ) {
+        return;
+      }
+
+      award = dailySignUpReward(cumulativeCount, operationalDate);
+      if (!award) return;
+
+      const [genre, detail, particular, templateLevel, count] = award;
+      const moneyId =
+        genre === 15 && detail === 1
+          ? MONEY_GOLD
+          : genre === 15 && detail === 2
+            ? MONEY_DIAMOND
+            : null;
+      if (moneyId !== null) {
+        let money = player.money.find(({ id }) => id === moneyId);
+        if (!money) {
+          money = { id: moneyId, count: 0 };
+          player.money.push(money);
+        }
+        money.count += count;
+        updatedMoneyIds.add(moneyId);
+      } else {
+        addInventoryAward(
+          player,
+          [genre, detail, particular, templateLevel, count],
+          updatedItemGuids,
+        );
+      }
+
+      cumulativeCount += 1;
+      player.taskValues[todayTaskId] = 1;
+      player.taskValues[totalTaskId] = cumulativeCount;
+      player.dailySignUp = {
+        cycle: operationalDate.slice(0, 7),
+        lastOperationalDate: operationalDate,
+      };
+      fresh = true;
+      state.schemaVersion = 9;
+    });
+    if (!player) throw new Error(`Failed to sign in player: ${account}`);
+    const snapshot = structuredClone(player);
+    this.#logger.info("player.daily_sign_up", {
+      account,
+      operationalDate: dailySignUpOperationalDate(now),
+      cumulativeCount,
+      fresh,
+      award,
+    });
+    return {
+      player: snapshot,
+      award,
+      fresh,
+      cumulativeCount,
+      updatedItems: snapshot.inventory.filter(({ guid }) => updatedItemGuids.has(guid)),
+      updatedMoney: snapshot.money.filter(({ id }) => updatedMoneyIds.has(id)),
+    };
+  }
+
   async savePendingGacha(
     account: string,
     poolId: number,
@@ -603,7 +731,7 @@ export class PlayerRepository {
         upPity: roll.counters.upPity,
         total: roll.counters.total,
       };
-      state.schemaVersion = 8;
+      state.schemaVersion = 9;
     });
     if (!player) throw new Error(`Failed to save pending gacha: ${account}`);
     return structuredClone(player);
@@ -663,7 +791,7 @@ export class PlayerRepository {
         addInventoryAward(player, pool.upBox, updatedItemGuids);
       }
       if (fromPending) player.gacha.pending = null;
-      state.schemaVersion = 8;
+      state.schemaVersion = 9;
     });
     if (!player) throw new Error(`Failed to perform gacha: ${account}`);
     const snapshot = structuredClone(player);
@@ -732,7 +860,7 @@ export class PlayerRepository {
       } else {
         player.cafe.coffees.push({ coffeetype: coffeeType, count });
       }
-      state.schemaVersion = 8;
+      state.schemaVersion = 9;
     });
     this.#logger.info("player.cafe.coffee_made", {
       account,
@@ -882,7 +1010,7 @@ export class PlayerRepository {
       if (letter && !letter.replyIds.includes(replyId)) {
         letter.replyIds.push(replyId);
       }
-      state.schemaVersion = 8;
+      state.schemaVersion = 9;
     });
     if (!player) throw new Error(`Failed to reply to phone letter: ${account}`);
     return structuredClone(player);
@@ -897,7 +1025,7 @@ export class PlayerRepository {
       player.phone.letters = player.phone.letters.filter(
         (letter) => letter.topicId !== topicId,
       );
-      state.schemaVersion = 8;
+      state.schemaVersion = 9;
     });
     if (!player) throw new Error(`Failed to remove phone letter: ${account}`);
     return structuredClone(player);
@@ -921,7 +1049,7 @@ export class PlayerRepository {
           replyIds: [],
         });
       }
-      state.schemaVersion = 8;
+      state.schemaVersion = 9;
     });
     if (!player) throw new Error(`Failed to add phone letter: ${account}`);
     return structuredClone(player);
@@ -999,7 +1127,7 @@ export class PlayerRepository {
           replyIds: [],
         });
       }
-      state.schemaVersion = 8;
+      state.schemaVersion = 9;
       player.exp += Math.max(0, masterExp);
 
       for (const [genre, detail, particular, templateLevel, rawCount] of awards) {
@@ -1131,7 +1259,7 @@ export class PlayerRepository {
 
 export function makeInitialState(): PersistedState {
   return {
-    schemaVersion: 8,
+    schemaVersion: 9,
     nextRoleId: 1,
     players: {},
     updatedAt: null,

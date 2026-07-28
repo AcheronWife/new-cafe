@@ -162,7 +162,7 @@ it("persists player and task changes atomically", async () => {
     ]);
 
     const persisted = JSON.parse(await readFile(filePath, "utf8"));
-    expect(persisted.schemaVersion).toBe(8);
+    expect(persisted.schemaVersion).toBe(9);
     expect(persisted.players.tester.name).toBe("Commander");
     expect(persisted.players.tester.taskValues["123"]).toBe(9);
     expect(persisted.players.tester.levels).toEqual([{ id: 65_793, star: 23 }]);
@@ -228,7 +228,7 @@ it("persists player and task changes atomically", async () => {
       enhanceExp: 17,
     });
     const migratedDocument = JSON.parse(await readFile(filePath, "utf8"));
-    expect(migratedDocument.schemaVersion).toBe(8);
+    expect(migratedDocument.schemaVersion).toBe(9);
     expect(migratedDocument.players.tester).not.toHaveProperty("cards");
     expect(migratedDocument.players.tester).not.toHaveProperty("items");
   } finally {

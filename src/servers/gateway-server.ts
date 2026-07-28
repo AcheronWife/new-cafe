@@ -418,6 +418,67 @@ export function createGatewayServer({
           ...(call ? { method: call.method, json: call.json } : {}),
         });
         send(COMMAND.C2S_CALL_RSP, packet.serial);
+        if (call?.method === "SignUpMsg") {
+          const parameters =
+            call.parameters && typeof call.parameters === "object"
+              ? (call.parameters as Record<string, unknown>)
+              : {};
+          const signUpType = Number(parameters.nType);
+          if (signUpType !== 1) {
+            send(
+              COMMAND.NTF_S2C_CALL,
+              0,
+              makeServerLuaCall("NormalActivityMsg", {
+                nType: 3,
+                nSubType: signUpType,
+                bSuccess: false,
+                tbAward: [],
+                isRefreshSign: false,
+              }),
+            );
+            logger.warn("daily_sign_up.unsupported_type", {
+              peer,
+              account: context.account,
+              signUpType,
+            });
+            return;
+          }
+
+          const result = await players.signUpDaily(context.account);
+          context.player = result.player;
+          send(COMMAND.TASK_VALUE_RSP, 0, makeTaskValueSync(result.player.taskValues));
+          if (result.updatedItems.length > 0) {
+            send(
+              COMMAND.ITEM_UPDATE_NTF,
+              0,
+              makeItemUpdateNotification(result.updatedItems),
+            );
+          }
+          for (const money of result.updatedMoney) {
+            send(COMMAND.MONEY_UPDATE_NTF, 0, makeMoneyUpdateNotification(money));
+          }
+          send(
+            COMMAND.NTF_S2C_CALL,
+            0,
+            makeServerLuaCall("NormalActivityMsg", {
+              nType: 3,
+              nSubType: 1,
+              bSuccess: true,
+              tbAward: result.award ? [result.award] : [],
+              isRefreshSign: result.fresh,
+            }),
+          );
+          logger.info("lua.callback", {
+            peer,
+            account: context.account,
+            method: "NormalActivityMsg",
+            feature: "daily_sign_up",
+            fresh: result.fresh,
+            cumulativeCount: result.cumulativeCount,
+            award: result.award,
+          });
+          return;
+        }
         if (call?.method === "Lottery" || call?.method === "GetFirstGacha") {
           const parameters =
             call.parameters && typeof call.parameters === "object"
