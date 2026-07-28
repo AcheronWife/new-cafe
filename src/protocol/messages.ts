@@ -8,11 +8,10 @@ import {
 
 import type { AppConfig } from "../config.js";
 import type {
-  CharacterCardState,
   FightCardState,
   FormationState,
   GirlState,
-  InventoryItemState,
+  InventoryEntryState,
   LevelState,
   MoneyState,
   Player,
@@ -162,7 +161,7 @@ export function makeFormationUpdateNotification(formation: FormationState): Buff
   return fieldBytes(1, makeFormationInfo(formation));
 }
 
-function makeItemInfo(item: CharacterCardState | InventoryItemState): Buffer {
+function makeItemInfo(item: InventoryEntryState): Buffer {
   return Buffer.concat([
     fieldVarint(1, item.guid),
     fieldVarint(2, item.genre),
@@ -178,15 +177,14 @@ function makeItemInfo(item: CharacterCardState | InventoryItemState): Buffer {
 }
 
 export function makeItemNotification(player: Player): Buffer {
-  const items = [...player.cards, ...player.items];
   return Buffer.concat([
-    ...items.map((item) => fieldBytes(1, makeItemInfo(item))),
-    fieldVarint(2, items.length),
+    ...player.inventory.map((item) => fieldBytes(1, makeItemInfo(item))),
+    fieldVarint(2, player.inventory.length),
   ]);
 }
 
 export function makeItemUpdateNotification(
-  items: readonly InventoryItemState[],
+  items: readonly InventoryEntryState[],
 ): Buffer {
   return Buffer.concat(items.map((item) => fieldBytes(1, makeItemInfo(item))));
 }

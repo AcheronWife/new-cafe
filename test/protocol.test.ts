@@ -29,14 +29,13 @@ describe("game protocol", () => {
     registerTime: 1,
     lastLoginAt: null,
     taskValues: {},
-    items: [],
     nextItemGuid: 20_001,
     money: [
       { id: 1, count: 28 },
       { id: 2, count: 0 },
       { id: 3, count: 0 },
     ],
-    cards: [
+    inventory: [
       {
         guid: 10_001,
         genre: 1,
@@ -111,9 +110,11 @@ describe("game protocol", () => {
   };
 
   it("encodes the 1-5 guide letter in PhoneMsgNtf", () => {
-    const phoneFields = decodeFields(makePhoneMessageNotification({
-      ...rosterPlayer,
-    }));
+    const phoneFields = decodeFields(
+      makePhoneMessageNotification({
+        ...rosterPlayer,
+      }),
+    );
     const letter = phoneFields[0]?.value;
     expect(Buffer.isBuffer(letter)).toBe(true);
     const letterFields = decodeFields(letter as Buffer);
@@ -174,10 +175,9 @@ describe("game protocol", () => {
         registerTime: 1,
         lastLoginAt: null,
         taskValues: {},
-        items: [],
+        inventory: [],
         nextItemGuid: 20_001,
         money: [],
-        cards: [],
         girls: [],
         formations: [],
         levels: [],
@@ -208,10 +208,9 @@ describe("game protocol", () => {
         registerTime: 1,
         lastLoginAt: "2026-07-28T00:00:00.000Z",
         taskValues: {},
-        items: [],
+        inventory: [],
         nextItemGuid: 20_001,
         money: [],
-        cards: [],
         girls: [],
         formations: [],
         levels: [],
@@ -317,7 +316,7 @@ describe("game protocol", () => {
 
   it("encodes incremental item and money notifications", () => {
     const item = {
-      ...rosterPlayer.cards[0]!,
+      ...rosterPlayer.inventory[0]!,
       guid: 20_001,
       genre: 7,
       detail: 1,

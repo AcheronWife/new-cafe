@@ -104,11 +104,7 @@ export class ChapterCatalog {
     return `${chapter}:${index}:${difficulty}`;
   }
 
-  get(
-    chapter: number,
-    index: number,
-    difficulty: number,
-  ): ChapterLevelConfig | null {
+  get(chapter: number, index: number, difficulty: number): ChapterLevelConfig | null {
     return this.#levels.get(ChapterCatalog.key(chapter, index, difficulty)) ?? null;
   }
 
@@ -119,9 +115,7 @@ export class ChapterCatalog {
 
 function deterministicRoll(seed: string, sequence: number, ceiling: number): number {
   if (ceiling <= 0) return 0;
-  const digest = createHash("sha256")
-    .update(`${seed}:${sequence}`)
-    .digest();
+  const digest = createHash("sha256").update(`${seed}:${sequence}`).digest();
   return digest.readUInt32LE(0) % ceiling;
 }
 

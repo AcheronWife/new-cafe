@@ -30,7 +30,18 @@ pnpm start
 
 - HTTP：`0.0.0.0:18080`
 - TCP 游戏网关：`0.0.0.0:30400`
-- 渠道列表向客户端公布：`192.168.101.4:30400`
+- 渠道列表向客户端公布：`127.0.0.1:30400`
+
+客户端也使用设备自身的 `127.0.0.1:18080` 请求渠道列表。连接设备后，在电脑
+上建立 ADB 反向转发：
+
+```sh
+pnpm adb:reverse
+```
+
+这会将设备的 `127.0.0.1:18080` 和 `127.0.0.1:30400` 分别转发到电脑上的
+同名端口。ADB 连接中断或设备重启后需要重新执行。移除转发可运行
+`pnpm adb:reverse:remove`。
 
 HTTP 接口：
 
@@ -66,7 +77,8 @@ tail -f logs/server.log
 - `GCG_HTTP_PORT`（兼容旧名 `GCG_PORT`）
 - `GCG_GATEWAY_HOST`
 - `GCG_GATEWAY_PORT`（兼容旧名 `GCG_GAME_PORT`）
-- `GCG_GAME_HOST`：渠道列表中公布给设备的电脑 IP
+- `GCG_GAME_HOST`：渠道列表向客户端公布的网关地址；ADB 反向转发模式保持
+  `127.0.0.1`
 - `GCG_LOG_LEVEL`：`debug`、`info`、`warn` 或 `error`
 
 ## 检查

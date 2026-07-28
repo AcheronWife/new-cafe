@@ -6,6 +6,12 @@ import {
 } from "../game-data/card-enhancement-data.js";
 import { INITIAL_COFFEE_TASK_VALUES, type CafeCoffee } from "../game-data/cafe-data.js";
 import type { Award } from "../game-data/chapter-config.js";
+import type {
+  GachaAward,
+  GachaPool,
+  GachaRollResult,
+  Gdpln,
+} from "../game-data/gacha-data.js";
 import type { Logger } from "../logger.js";
 import type { JsonStore } from "./json-store.js";
 
@@ -13,8 +19,14 @@ export const FIRST_LEVEL_TASK_ID = (1 << 16) | 15;
 export const MONEY_VIGOUR = 1;
 export const MONEY_GOLD = 2;
 export const MONEY_DIAMOND = 3;
+export const MONEY_PAY_DIAMOND = 12;
+export const GACHA_TASK_GROUP = 15;
 
-export interface CharacterCardState {
+export function makeGachaTaskId(taskId: number): number {
+  return (GACHA_TASK_GROUP << 16) | taskId;
+}
+
+export interface InventoryEntryState {
   guid: number;
   genre: number;
   detail: number;
@@ -27,7 +39,20 @@ export interface CharacterCardState {
   breakLevel: number;
 }
 
-export type InventoryItemState = CharacterCardState;
+export type CharacterCardState = InventoryEntryState;
+export type InventoryItemState = InventoryEntryState;
+
+const INSTANCE_GENRES = new Set([1, 2, 3, 4]);
+
+export function isCharacterCard(
+  entry: InventoryEntryState,
+): entry is CharacterCardState {
+  return entry.genre === 1;
+}
+
+export function isInventoryInstance(entry: InventoryEntryState): boolean {
+  return INSTANCE_GENRES.has(entry.genre);
+}
 
 export interface MoneyState {
   id: number;
@@ -78,6 +103,19 @@ export interface PhoneState {
   letters: PhoneLetterState[];
 }
 
+export interface PendingGachaState {
+  poolId: number;
+  ten: boolean;
+  awards: GachaAward[];
+  pity: number;
+  upPity: number;
+  total: number;
+}
+
+export interface GachaState {
+  pending: PendingGachaState | null;
+}
+
 export interface Player {
   account: string;
   roleId: number;
@@ -89,8 +127,7 @@ export interface Player {
   registerTime: number;
   lastLoginAt: string | null;
   taskValues: Record<string, number>;
-  cards: CharacterCardState[];
-  items: InventoryItemState[];
+  inventory: InventoryEntryState[];
   nextItemGuid: number;
   money: MoneyState[];
   girls: GirlState[];
@@ -98,10 +135,11 @@ export interface Player {
   levels: LevelState[];
   cafe: CafeState;
   phone: PhoneState;
+  gacha?: GachaState;
 }
 
 export interface PersistedState {
-  schemaVersion: 6;
+  schemaVersion: 8;
   nextRoleId: number;
   players: Record<string, Player>;
   updatedAt: string | null;
@@ -125,6 +163,14 @@ export interface CardEnhancementResult {
   addedExperience: number;
 }
 
+export interface GachaCommitResult {
+  player: Player;
+  awards: GachaAward[];
+  updatedItems: InventoryItemState[];
+  updatedMoney: MoneyState[];
+  getItem: Gdpln | null;
+}
+
 export class InsufficientVigourError extends Error {
   constructor(
     readonly required: number,
@@ -132,6 +178,13 @@ export class InsufficientVigourError extends Error {
   ) {
     super(`Insufficient vigour: required ${required}, available ${available}`);
     this.name = "InsufficientVigourError";
+  }
+}
+
+export class InsufficientGachaCurrencyError extends Error {
+  constructor(readonly poolId: number) {
+    super(`Insufficient currency for gacha pool ${poolId}`);
+    this.name = "InsufficientGachaCurrencyError";
   }
 }
 
@@ -151,6 +204,10 @@ function makeInitialCafeState(): CafeState {
 
 function makeInitialPhoneState(): PhoneState {
   return { letters: [] };
+}
+
+function makeInitialGachaState(): GachaState {
+  return { pending: null };
 }
 
 function hasCompletedLevel(
@@ -193,10 +250,46 @@ function migratePhoneState(player: Player): PhoneState {
   return makeInitialPhoneState();
 }
 
+interface LegacyInventoryPlayer {
+  inventory?: InventoryEntryState[];
+  cards?: CharacterCardState[];
+  items?: InventoryItemState[];
+}
+
+function migrateInventoryState(player: Player): void {
+  const legacy = player as Player & LegacyInventoryPlayer;
+  if (!legacy.inventory) {
+    legacy.inventory = [...(legacy.cards ?? []), ...(legacy.items ?? [])];
+  }
+
+  const migrated: InventoryEntryState[] = [];
+  let nextGuid = Math.max(
+    player.nextItemGuid,
+    ...legacy.inventory.map(({ guid }) => guid + 1),
+  );
+  for (const entry of legacy.inventory) {
+    if (!isInventoryInstance(entry) || entry.count <= 1) {
+      migrated.push({
+        ...entry,
+        count: isInventoryInstance(entry) ? 1 : entry.count,
+      });
+      continue;
+    }
+    migrated.push({ ...entry, count: 1 });
+    for (let index = 1; index < entry.count; index += 1) {
+      migrated.push({ ...entry, guid: nextGuid++, count: 1 });
+    }
+  }
+  player.inventory = migrated;
+  player.nextItemGuid = Math.max(nextGuid, player.nextItemGuid);
+  delete legacy.cards;
+  delete legacy.items;
+}
+
 function makeStarterRoster(
   createTime: number,
-): Pick<Player, "cards" | "girls" | "formations"> {
-  const cards: CharacterCardState[] = [
+): Pick<Player, "inventory" | "girls" | "formations"> {
+  const inventory: CharacterCardState[] = [
     {
       guid: 10_001,
       genre: 1,
@@ -247,7 +340,7 @@ function makeStarterRoster(
     {
       id: 1,
       title: "初始阵容",
-      fightCards: cards.map((card) => ({
+      fightCards: inventory.map((card) => ({
         mainCardGuid: card.guid,
         secondaryCardGuids: [],
         usedCardGuid: card.guid,
@@ -256,7 +349,7 @@ function makeStarterRoster(
       })),
     },
   ];
-  return { cards, girls, formations };
+  return { inventory, girls, formations };
 }
 
 export function makeLevelId(
@@ -265,6 +358,123 @@ export function makeLevelId(
   difficulty: number,
 ): number {
   return (chapter << 16) | (index << 8) | difficulty;
+}
+
+function addInventoryAward(
+  player: Player,
+  award: readonly [number, number, number, number, number],
+  updatedItemGuids: Set<number>,
+): void {
+  const [genre, detail, particular, templateLevel, rawCount] = award;
+  const count = Math.max(0, rawCount);
+  if (count === 0) return;
+  if (INSTANCE_GENRES.has(genre)) {
+    for (let index = 0; index < count; index++) {
+      const item: InventoryEntryState = {
+        guid: player.nextItemGuid++,
+        genre,
+        detail,
+        particular,
+        templateLevel,
+        count: 1,
+        createTime: unixTime(),
+        enhanceLevel: 0,
+        enhanceExp: 0,
+        breakLevel: 0,
+      };
+      player.inventory.push(item);
+      updatedItemGuids.add(item.guid);
+    }
+    return;
+  }
+
+  let item = player.inventory.find(
+    (candidate) =>
+      !isInventoryInstance(candidate) &&
+      candidate.genre === genre &&
+      candidate.detail === detail &&
+      candidate.particular === particular &&
+      candidate.templateLevel === templateLevel,
+  );
+  if (!item) {
+    item = {
+      guid: player.nextItemGuid++,
+      genre,
+      detail,
+      particular,
+      templateLevel,
+      count: 0,
+      createTime: unixTime(),
+      enhanceLevel: 0,
+      enhanceExp: 0,
+      breakLevel: 0,
+    };
+    player.inventory.push(item);
+  }
+  item.count += count;
+  updatedItemGuids.add(item.guid);
+}
+
+function deductGachaCost(
+  player: Player,
+  pool: GachaPool,
+  ten: boolean,
+  updatedItemGuids: Set<number>,
+  updatedMoneyIds: Set<number>,
+): void {
+  const itemCost = ten ? pool.costTen : pool.costOne;
+  if (itemCost) {
+    const [genre, detail, particular, templateLevel, count] = itemCost;
+    const ticket = player.inventory.find(
+      (item) =>
+        item.genre === genre &&
+        item.detail === detail &&
+        item.particular === particular &&
+        item.templateLevel === templateLevel &&
+        item.count >= count,
+    );
+    if (ticket) {
+      ticket.count -= count;
+      updatedItemGuids.add(ticket.guid);
+      return;
+    }
+    if (pool.cashType === 1) {
+      throw new InsufficientGachaCurrencyError(pool.id);
+    }
+  }
+
+  if (pool.cashType === 0) {
+    const required = pool.exchangeRate * (ten ? 10 : 1);
+    const free = player.money.find(({ id }) => id === MONEY_DIAMOND);
+    const paid = player.money.find(({ id }) => id === MONEY_PAY_DIAMOND);
+    const freeCost = pool.canUseFreeDiamond ? Math.min(free?.count ?? 0, required) : 0;
+    const paidCost = required - freeCost;
+    if ((paid?.count ?? 0) < paidCost) {
+      throw new InsufficientGachaCurrencyError(pool.id);
+    }
+    if (freeCost > 0 && free) {
+      free.count -= freeCost;
+      updatedMoneyIds.add(MONEY_DIAMOND);
+    }
+    if (paidCost > 0 && paid) {
+      paid.count -= paidCost;
+      updatedMoneyIds.add(MONEY_PAY_DIAMOND);
+    }
+    return;
+  }
+
+  if (pool.cashType > 1) {
+    const required = ten ? pool.moneyCostTen : pool.moneyCostOne;
+    const money = player.money.find(({ id }) => id === pool.cashType);
+    if (!money || money.count < required) {
+      throw new InsufficientGachaCurrencyError(pool.id);
+    }
+    money.count -= required;
+    updatedMoneyIds.add(pool.cashType);
+    return;
+  }
+
+  throw new InsufficientGachaCurrencyError(pool.id);
 }
 
 export class PlayerRepository {
@@ -284,9 +494,11 @@ export class PlayerRepository {
     await this.#store.update((state) => {
       player = state.players[safeAccount];
       if (player) {
+        migrateInventoryState(player);
         player.cafe ??= makeInitialCafeState();
         player.phone ??= migratePhoneState(player);
-        state.schemaVersion = 6;
+        player.gacha ??= makeInitialGachaState();
+        state.schemaVersion = 8;
         return;
       }
 
@@ -307,7 +519,6 @@ export class PlayerRepository {
           ...(this.#defaults.firstLevelComplete ? { [FIRST_LEVEL_TASK_ID]: 6 } : {}),
         },
         levels: [],
-        items: [],
         nextItemGuid: 20_001,
         money: [
           { id: MONEY_VIGOUR, count: 28 },
@@ -316,9 +527,10 @@ export class PlayerRepository {
         ],
         cafe: makeInitialCafeState(),
         phone: makeInitialPhoneState(),
+        gacha: makeInitialGachaState(),
         ...makeStarterRoster(registerTime),
       };
-      state.schemaVersion = 6;
+      state.schemaVersion = 8;
       state.players[safeAccount] = player;
       this.#logger.info("player.created", { account: safeAccount, roleId });
     });
@@ -372,6 +584,129 @@ export class PlayerRepository {
     return structuredClone(player);
   }
 
+  async savePendingGacha(
+    account: string,
+    poolId: number,
+    ten: boolean,
+    roll: GachaRollResult,
+  ): Promise<Player> {
+    let player: Player | undefined;
+    await this.#store.update((state) => {
+      player = state.players[account];
+      if (!player) throw new Error(`Unknown player account: ${account}`);
+      player.gacha ??= makeInitialGachaState();
+      player.gacha.pending = {
+        poolId,
+        ten,
+        awards: structuredClone(roll.awards),
+        pity: roll.counters.pity,
+        upPity: roll.counters.upPity,
+        total: roll.counters.total,
+      };
+      state.schemaVersion = 8;
+    });
+    if (!player) throw new Error(`Failed to save pending gacha: ${account}`);
+    return structuredClone(player);
+  }
+
+  async performGacha(
+    account: string,
+    pool: GachaPool,
+    ten: boolean,
+    roll: GachaRollResult,
+    fromPending = false,
+  ): Promise<GachaCommitResult> {
+    let player: Player | undefined;
+    const updatedItemGuids = new Set<number>();
+    const updatedMoneyIds = new Set<number>();
+    let getItem: Gdpln | null = null;
+    await this.#store.update((state) => {
+      player = state.players[account];
+      if (!player) throw new Error(`Unknown player account: ${account}`);
+      player.gacha ??= makeInitialGachaState();
+      deductGachaCost(player, pool, ten, updatedItemGuids, updatedMoneyIds);
+
+      player.taskValues[String(makeGachaTaskId(2 + pool.id))] = roll.counters.pity;
+      if (pool.protectUpNum > 0) {
+        player.taskValues[String(makeGachaTaskId(2001 + pool.id))] =
+          roll.counters.upPity;
+      }
+      player.taskValues[String(makeGachaTaskId(3001 + pool.id))] = roll.counters.total;
+      if (pool.rotateVersion > 0) {
+        player.taskValues[String(makeGachaTaskId(10_005))] = pool.rotateVersion;
+      }
+      player.taskValues[String(makeGachaTaskId(1))] =
+        (player.taskValues[String(makeGachaTaskId(1))] ?? 0) + roll.awards.length;
+      const operationTask = ten ? 10_002 : 10_001;
+      player.taskValues[String(makeGachaTaskId(operationTask))] =
+        (player.taskValues[String(makeGachaTaskId(operationTask))] ?? 0) + 1;
+
+      for (const award of roll.awards) {
+        addInventoryAward(player, [...award.tbGDPL, 1], updatedItemGuids);
+      }
+
+      if (pool.getItem) {
+        getItem = [...pool.getItem] as Gdpln;
+        getItem[4] *= roll.awards.length;
+        addInventoryAward(player, getItem, updatedItemGuids);
+      }
+
+      const wonUpBox =
+        pool.upBox &&
+        pool.upBoxNum > 0 &&
+        roll.awards.some(
+          ({ nTotalTimes }) =>
+            nTotalTimes === pool.upBoxNum ||
+            (pool.rotateVersion > 0 && nTotalTimes % pool.upBoxNum === 0),
+        );
+      if (wonUpBox && pool.upBox) {
+        addInventoryAward(player, pool.upBox, updatedItemGuids);
+      }
+      if (fromPending) player.gacha.pending = null;
+      state.schemaVersion = 8;
+    });
+    if (!player) throw new Error(`Failed to perform gacha: ${account}`);
+    const snapshot = structuredClone(player);
+    this.#logger.info("player.gacha.completed", {
+      account,
+      poolId: pool.id,
+      ten,
+      awards: roll.awards.map(({ nId, tbGDPL, isUp }) => ({
+        nId,
+        tbGDPL,
+        isUp,
+      })),
+      counters: roll.counters,
+      fromPending,
+    });
+    return {
+      player: snapshot,
+      awards: structuredClone(roll.awards),
+      updatedItems: snapshot.inventory.filter(({ guid }) => updatedItemGuids.has(guid)),
+      updatedMoney: snapshot.money.filter(({ id }) => updatedMoneyIds.has(id)),
+      getItem,
+    };
+  }
+
+  async setGachaCustomUp(
+    account: string,
+    poolId: number,
+    itemIds: readonly number[],
+  ): Promise<Player> {
+    const low = itemIds[0] ?? 0;
+    const high = itemIds[1] ?? 0;
+    const packed = (low & 0xffff) | ((high & 0xffff) << 16);
+    return this.setTaskValues(account, [
+      { id: makeGachaTaskId(6001 + poolId), value: packed >>> 0 },
+      {
+        id: makeGachaTaskId(7001 + poolId),
+        value:
+          (this.get(account)?.taskValues[String(makeGachaTaskId(7001 + poolId))] ?? 0) +
+          1,
+      },
+    ]);
+  }
+
   async makeCoffee(
     account: string,
     coffeeType: number,
@@ -397,7 +732,7 @@ export class PlayerRepository {
       } else {
         player.cafe.coffees.push({ coffeetype: coffeeType, count });
       }
-      state.schemaVersion = 6;
+      state.schemaVersion = 8;
     });
     this.#logger.info("player.cafe.coffee_made", {
       account,
@@ -420,7 +755,9 @@ export class PlayerRepository {
     await this.#store.update((state) => {
       player = state.players[account];
       if (!player) throw new Error(`Unknown player account: ${account}`);
-      enhancedCard = player.cards.find((card) => card.guid === guid);
+      enhancedCard = player.inventory.find(
+        (entry) => entry.guid === guid && isCharacterCard(entry),
+      );
       if (!enhancedCard) throw new Error(`Unknown character card: ${guid}`);
 
       for (const material of materials) {
@@ -435,7 +772,7 @@ export class PlayerRepository {
             `Unknown card experience material index: ${material.reference}`,
           );
         }
-        const item = player.items.find(
+        const item = player.inventory.find(
           (candidate) =>
             candidate.genre === definition.genre &&
             candidate.detail === definition.detail &&
@@ -472,12 +809,14 @@ export class PlayerRepository {
       experience: enhancedCard.enhanceExp,
     });
     const snapshot = structuredClone(player);
-    const card = snapshot.cards.find((candidate) => candidate.guid === guid);
+    const card = snapshot.inventory.find(
+      (candidate) => candidate.guid === guid && isCharacterCard(candidate),
+    );
     if (!card) throw new Error(`Enhanced card disappeared: ${guid}`);
     return {
       player: snapshot,
       card,
-      consumedItems: snapshot.items.filter(({ guid: itemGuid }) =>
+      consumedItems: snapshot.inventory.filter(({ guid: itemGuid }) =>
         consumedItemGuids.has(itemGuid),
       ),
       addedExperience,
@@ -490,19 +829,10 @@ export class PlayerRepository {
       player = state.players[account];
       if (!player) throw new Error(`Unknown player account: ${account}`);
 
-      // Character cards can come from both the starter roster and chapter
-      // awards. Awarded inventory is stored in `items`, but the client exposes
-      // genre 1 entries through EquipManager.GetAllCard and may legitimately
-      // place their GUIDs in a formation.
-      const ownedCards = new Set([
-        ...player.cards.map(({ guid }) => guid),
-        ...player.items
-          .filter(({ genre }) => genre === 1)
-          .map(({ guid }) => guid),
-      ]);
-      const ownedInventory = new Set(
-        [...player.cards, ...player.items].map(({ guid }) => guid),
+      const ownedCards = new Set(
+        player.inventory.filter(isCharacterCard).map(({ guid }) => guid),
       );
+      const ownedInventory = new Set(player.inventory.map(({ guid }) => guid));
       for (const fightCard of formation.fightCards) {
         const referencedCards = [
           fightCard.mainCardGuid,
@@ -517,9 +847,7 @@ export class PlayerRepository {
           ...fightCard.runeItemGuids,
         ].filter((guid) => guid > 0);
         if (referencedEquipment.some((guid) => !ownedInventory.has(guid))) {
-          throw new Error(
-            `Formation ${formation.id} references unknown equipment`,
-          );
+          throw new Error(`Formation ${formation.id} references unknown equipment`);
         }
       }
 
@@ -554,7 +882,7 @@ export class PlayerRepository {
       if (letter && !letter.replyIds.includes(replyId)) {
         letter.replyIds.push(replyId);
       }
-      state.schemaVersion = 6;
+      state.schemaVersion = 8;
     });
     if (!player) throw new Error(`Failed to reply to phone letter: ${account}`);
     return structuredClone(player);
@@ -569,7 +897,7 @@ export class PlayerRepository {
       player.phone.letters = player.phone.letters.filter(
         (letter) => letter.topicId !== topicId,
       );
-      state.schemaVersion = 6;
+      state.schemaVersion = 8;
     });
     if (!player) throw new Error(`Failed to remove phone letter: ${account}`);
     return structuredClone(player);
@@ -585,9 +913,7 @@ export class PlayerRepository {
       if (!player) throw new Error(`Unknown player account: ${account}`);
       player.phone ??= migratePhoneState(player);
       if (
-        !player.phone.letters.some(
-          (candidate) => candidate.topicId === letter.topicId,
-        )
+        !player.phone.letters.some((candidate) => candidate.topicId === letter.topicId)
       ) {
         player.phone.letters.push({
           ...letter,
@@ -595,7 +921,7 @@ export class PlayerRepository {
           replyIds: [],
         });
       }
-      state.schemaVersion = 6;
+      state.schemaVersion = 8;
     });
     if (!player) throw new Error(`Failed to add phone letter: ${account}`);
     return structuredClone(player);
@@ -673,7 +999,7 @@ export class PlayerRepository {
           replyIds: [],
         });
       }
-      state.schemaVersion = 6;
+      state.schemaVersion = 8;
       player.exp += Math.max(0, masterExp);
 
       for (const [genre, detail, particular, templateLevel, rawCount] of awards) {
@@ -697,30 +1023,50 @@ export class PlayerRepository {
           continue;
         }
 
-        let item = player.items.find(
-          (candidate) =>
-            candidate.genre === genre &&
-            candidate.detail === detail &&
-            candidate.particular === particular &&
-            candidate.templateLevel === templateLevel,
-        );
-        if (!item) {
-          item = {
-            guid: player.nextItemGuid++,
-            genre,
-            detail,
-            particular,
-            templateLevel,
-            count: 0,
-            createTime: unixTime(),
-            enhanceLevel: 0,
-            enhanceExp: 0,
-            breakLevel: 0,
-          };
-          player.items.push(item);
+        if (INSTANCE_GENRES.has(genre)) {
+          for (let itemIndex = 0; itemIndex < count; itemIndex += 1) {
+            const item: InventoryEntryState = {
+              guid: player.nextItemGuid++,
+              genre,
+              detail,
+              particular,
+              templateLevel,
+              count: 1,
+              createTime: unixTime(),
+              enhanceLevel: 0,
+              enhanceExp: 0,
+              breakLevel: 0,
+            };
+            player.inventory.push(item);
+            updatedItemGuids.add(item.guid);
+          }
+        } else {
+          let item = player.inventory.find(
+            (candidate) =>
+              !isInventoryInstance(candidate) &&
+              candidate.genre === genre &&
+              candidate.detail === detail &&
+              candidate.particular === particular &&
+              candidate.templateLevel === templateLevel,
+          );
+          if (!item) {
+            item = {
+              guid: player.nextItemGuid++,
+              genre,
+              detail,
+              particular,
+              templateLevel,
+              count: 0,
+              createTime: unixTime(),
+              enhanceLevel: 0,
+              enhanceExp: 0,
+              breakLevel: 0,
+            };
+            player.inventory.push(item);
+          }
+          item.count += count;
+          updatedItemGuids.add(item.guid);
         }
-        item.count += count;
-        updatedItemGuids.add(item.guid);
       }
     });
     if (!player) throw new Error(`Failed to settle level: ${account}`);
@@ -735,7 +1081,7 @@ export class PlayerRepository {
     const snapshot = structuredClone(player);
     return {
       player: snapshot,
-      updatedItems: snapshot.items.filter(({ guid }) => updatedItemGuids.has(guid)),
+      updatedItems: snapshot.inventory.filter(({ guid }) => updatedItemGuids.has(guid)),
       updatedMoney: snapshot.money.filter(({ id }) => updatedMoneyIds.has(id)),
     };
   }
@@ -785,7 +1131,7 @@ export class PlayerRepository {
 
 export function makeInitialState(): PersistedState {
   return {
-    schemaVersion: 6,
+    schemaVersion: 8,
     nextRoleId: 1,
     players: {},
     updatedAt: null,

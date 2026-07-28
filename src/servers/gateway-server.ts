@@ -28,6 +28,7 @@ import {
   LUA_COMMAND_WRITE_GUIDE_LOG,
   makeGuideLogAcknowledgement,
 } from "../game-data/guide-data.js";
+import { GachaCatalog, type GachaRollResult } from "../game-data/gacha-data.js";
 import {
   LUA_COMMAND_SHOP_GOODS_LIST,
   makeShopGoodsListResponse,
@@ -39,6 +40,9 @@ import {
 import type { Logger } from "../logger.js";
 import {
   InsufficientVigourError,
+  InsufficientGachaCurrencyError,
+  isCharacterCard,
+  makeGachaTaskId,
   makeLevelId,
   MONEY_VIGOUR,
   type FormationState,
@@ -245,7 +249,9 @@ export function createGatewayServer({
   players,
 }: GatewayServerOptions): Server {
   const chapterCatalog = ChapterCatalog.loadDefault();
+  const gachaCatalog = GachaCatalog.loadDefault();
   logger.info("game_data.chapter.loaded", { levels: chapterCatalog.size });
+  logger.info("game_data.gacha.loaded", { pools: gachaCatalog.size });
   return createServer((socket) => {
     const peer = peerName(socket);
     const context: ConnectionContext = {
@@ -338,11 +344,7 @@ export function createGatewayServer({
         await new Promise((resolve) => setTimeout(resolve, 20));
         send(COMMAND.ITEM_NTF, 0, makeItemNotification(context.player));
         await new Promise((resolve) => setTimeout(resolve, 20));
-        send(
-          COMMAND.PHONE_MSG_NTF,
-          0,
-          makePhoneMessageNotification(context.player),
-        );
+        send(COMMAND.PHONE_MSG_NTF, 0, makePhoneMessageNotification(context.player));
         await new Promise((resolve) => setTimeout(resolve, 40));
         send(COMMAND.LOGIN_RSP, packet.serial);
         return;
@@ -416,6 +418,264 @@ export function createGatewayServer({
           ...(call ? { method: call.method, json: call.json } : {}),
         });
         send(COMMAND.C2S_CALL_RSP, packet.serial);
+        if (call?.method === "Lottery" || call?.method === "GetFirstGacha") {
+          const parameters =
+            call.parameters && typeof call.parameters === "object"
+              ? (call.parameters as Record<string, unknown>)
+              : {};
+          const poolId = call.method === "GetFirstGacha" ? 666 : Number(parameters.nId);
+          const ten = call.method === "GetFirstGacha" ? true : parameters.bTen === true;
+          const pool = gachaCatalog.get(poolId);
+          if (!pool) {
+            send(
+              COMMAND.NTF_S2C_CALL,
+              0,
+              makeServerLuaCall("Lottery", { err: "error.gacha.notexists" }),
+            );
+            return;
+          }
+          const currentPlayer =
+            context.player ?? (await players.getOrCreate(context.account));
+          const pity =
+            currentPlayer.taskValues[String(makeGachaTaskId(2 + poolId))] ?? 0;
+          let upPity =
+            currentPlayer.taskValues[String(makeGachaTaskId(2001 + poolId))] ?? 0;
+          const storedRotationVersion =
+            currentPlayer.taskValues[String(makeGachaTaskId(10_005))] ?? 0;
+          if (pool.rotateVersion > 0 && storedRotationVersion !== pool.rotateVersion) {
+            upPity = 0;
+          }
+          const total =
+            currentPlayer.taskValues[String(makeGachaTaskId(3001 + poolId))] ?? 0;
+          const selectedPacked =
+            currentPlayer.taskValues[String(makeGachaTaskId(6001 + poolId))] ?? 0;
+          const selectedUpIds = [
+            selectedPacked & 0xffff,
+            (selectedPacked >>> 16) & 0xffff,
+          ].filter((id) => id > 0);
+          const ownedCards = new Set(
+            currentPlayer.inventory
+              .filter(isCharacterCard)
+              .map(
+                ({ genre, detail, particular, templateLevel }) =>
+                  `${genre}:${detail}:${particular}:${templateLevel}`,
+              ),
+          );
+          try {
+            const roll = gachaCatalog.roll(
+              poolId,
+              ten,
+              { pity, upPity, total },
+              ownedCards,
+              selectedUpIds,
+            );
+            if (pool.judgeType === 2 && call.method !== "GetFirstGacha") {
+              context.player = await players.savePendingGacha(
+                context.account,
+                poolId,
+                ten,
+                roll,
+              );
+              send(
+                COMMAND.NTF_S2C_CALL,
+                0,
+                makeServerLuaCall("Lottery", {
+                  bTen: ten,
+                  bGetCard: false,
+                  tbAwards: roll.awards,
+                  ...(pool.getItem
+                    ? {
+                        getItem: [
+                          ...pool.getItem.slice(0, 4),
+                          pool.getItem[4] * roll.awards.length,
+                        ],
+                      }
+                    : {}),
+                }),
+              );
+              logger.info("gacha.pending.saved", {
+                account: context.account,
+                poolId,
+                awards: roll.awards.length,
+              });
+              return;
+            }
+            const result = await players.performGacha(context.account, pool, ten, roll);
+            context.player = result.player;
+            if (result.updatedItems.length > 0) {
+              send(
+                COMMAND.ITEM_UPDATE_NTF,
+                0,
+                makeItemUpdateNotification(result.updatedItems),
+              );
+            }
+            for (const money of result.updatedMoney) {
+              send(COMMAND.MONEY_UPDATE_NTF, 0, makeMoneyUpdateNotification(money));
+            }
+            send(
+              COMMAND.TASK_VALUE_RSP,
+              0,
+              makeTaskValueSync(result.player.taskValues),
+            );
+            send(
+              COMMAND.NTF_S2C_CALL,
+              0,
+              makeServerLuaCall("Lottery", {
+                bTen: ten,
+                bGetCard: true,
+                tbAwards: result.awards,
+                ...(result.getItem ? { getItem: result.getItem } : {}),
+              }),
+            );
+            logger.info("gacha.response", {
+              account: context.account,
+              poolId,
+              ten,
+              awards: result.awards.length,
+            });
+          } catch (error) {
+            if (error instanceof InsufficientGachaCurrencyError) {
+              send(
+                COMMAND.NTF_S2C_CALL,
+                0,
+                makeServerLuaCall("Lottery", {
+                  err: "error.gacha.cash",
+                }),
+              );
+              logger.warn("gacha.insufficient_currency", {
+                account: context.account,
+                poolId,
+              });
+              return;
+            }
+            throw error;
+          }
+          return;
+        }
+        if (call?.method === "GetLastGacha") {
+          const currentPlayer =
+            context.player ?? (await players.getOrCreate(context.account));
+          const pendingGacha = currentPlayer.gacha?.pending;
+          if (!pendingGacha) {
+            send(
+              COMMAND.NTF_S2C_CALL,
+              0,
+              makeServerLuaCall("GetLastGacha", {
+                err: "error.gacha.nolast",
+              }),
+            );
+            return;
+          }
+          const shouldClaim = call.parameters === true;
+          if (!shouldClaim) {
+            send(
+              COMMAND.NTF_S2C_CALL,
+              0,
+              makeServerLuaCall("GetLastGacha", {
+                bTen: pendingGacha.ten,
+                bGetCard: false,
+                tbAwards: pendingGacha.awards,
+              }),
+            );
+            return;
+          }
+          const pool = gachaCatalog.get(pendingGacha.poolId);
+          if (!pool) {
+            send(
+              COMMAND.NTF_S2C_CALL,
+              0,
+              makeServerLuaCall("GetLastGacha", {
+                err: "error.gacha.nolast",
+              }),
+            );
+            return;
+          }
+          const roll: GachaRollResult = {
+            awards: pendingGacha.awards,
+            counters: {
+              pity: pendingGacha.pity,
+              upPity: pendingGacha.upPity,
+              total: pendingGacha.total,
+            },
+          };
+          try {
+            const result = await players.performGacha(
+              context.account,
+              pool,
+              pendingGacha.ten,
+              roll,
+              true,
+            );
+            context.player = result.player;
+            if (result.updatedItems.length > 0) {
+              send(
+                COMMAND.ITEM_UPDATE_NTF,
+                0,
+                makeItemUpdateNotification(result.updatedItems),
+              );
+            }
+            for (const money of result.updatedMoney) {
+              send(COMMAND.MONEY_UPDATE_NTF, 0, makeMoneyUpdateNotification(money));
+            }
+            send(
+              COMMAND.TASK_VALUE_RSP,
+              0,
+              makeTaskValueSync(result.player.taskValues),
+            );
+            send(
+              COMMAND.NTF_S2C_CALL,
+              0,
+              makeServerLuaCall("GetLastGacha", {
+                bTen: true,
+                bGetCard: true,
+                tbAwards: result.awards,
+                ...(result.getItem ? { getItem: result.getItem } : {}),
+              }),
+            );
+          } catch (error) {
+            if (error instanceof InsufficientGachaCurrencyError) {
+              send(
+                COMMAND.NTF_S2C_CALL,
+                0,
+                makeServerLuaCall("Lottery", {
+                  err: "error.gacha.cash",
+                }),
+              );
+              return;
+            }
+            throw error;
+          }
+          return;
+        }
+        if (call?.method === "SetCardCustomUp") {
+          const parameters =
+            call.parameters && typeof call.parameters === "object"
+              ? (call.parameters as Record<string, unknown>)
+              : {};
+          const poolId = Number(parameters.nId);
+          const itemIds = Array.isArray(parameters.tbItems)
+            ? parameters.tbItems
+                .map(Number)
+                .filter((id) => Number.isSafeInteger(id) && id > 0)
+            : [];
+          context.player = await players.setGachaCustomUp(
+            context.account,
+            poolId,
+            itemIds,
+          );
+          send(COMMAND.TASK_VALUE_RSP, 0, makeTaskValueSync(context.player.taskValues));
+          send(
+            COMMAND.NTF_S2C_CALL,
+            0,
+            makeServerLuaCall("SetCardCustomUp", { nId: poolId }),
+          );
+          logger.info("gacha.custom_up.updated", {
+            account: context.account,
+            poolId,
+            itemIds,
+          });
+          return;
+        }
         if (call?.method === "PhoneMsg") {
           const parameters = call.parameters as Record<string, unknown> | undefined;
           const phoneCommand = Number(parameters?.nCmd);
@@ -446,11 +706,7 @@ export function createGatewayServer({
             );
             const replyId =
               definition && letter
-                ? makePhoneReplyId(
-                    definition,
-                    selectionId,
-                    letter.replyIds,
-                  )
+                ? makePhoneReplyId(definition, selectionId, letter.replyIds)
                 : null;
             if (replyId !== null) {
               context.player = await players.replyToPhoneLetter(
@@ -496,10 +752,7 @@ export function createGatewayServer({
               });
               return;
             }
-            context.player = await players.removePhoneLetter(
-              context.account,
-              topicId,
-            );
+            context.player = await players.removePhoneLetter(context.account, topicId);
             send(
               COMMAND.NTF_S2C_CALL,
               0,
@@ -627,8 +880,8 @@ export function createGatewayServer({
           }
           const currentPlayer =
             context.player ?? (await players.getOrCreate(context.account));
-          const currentCard = currentPlayer.cards.find(
-            ({ guid }) => guid === request.guid,
+          const currentCard = currentPlayer.inventory.find(
+            (entry) => entry.guid === request.guid && isCharacterCard(entry),
           );
           if (currentCard?.enhanceLevel !== request.clientLevel) {
             send(
