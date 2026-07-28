@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import { GachaCatalog } from "../src/game-data/gacha-data.js";
 
 const catalog = GachaCatalog.loadDefault();
+const weaponCatalog = GachaCatalog.loadDefault(0);
 
 describe("original client gacha tables", () => {
   it("loads the latest definition of all 63 role pools", () => {
@@ -93,5 +94,45 @@ describe("original client gacha tables", () => {
         ),
       ).not.toThrow();
     }
+  });
+
+  it("loads weapon pools and uses their explicit rarity column", () => {
+    expect(weaponCatalog.size).toBe(19);
+    expect(weaponCatalog.ids).toContain(1);
+    expect(weaponCatalog.publishedStarWeights(1, 1)).toEqual([
+      1_200, 7_000, 1_500, 300,
+    ]);
+    const result = weaponCatalog.roll(
+      1,
+      false,
+      { pity: 0, upPity: 0, total: 0 },
+      new Set(),
+      [],
+      () => 0,
+    );
+    expect(result.awards[0]).toMatchObject({
+      tbGDPL: [2, expect.any(Number), expect.any(Number), 1],
+    });
+  });
+
+  it("applies the original 50-percent weapon custom-UP split", () => {
+    const pool = weaponCatalog.get(700)!;
+    const selectedIds = pool.normalCards
+      .get(4)!
+      .slice(0, 2)
+      .map(({ id }) => id);
+    const rolls = [9_999, 0];
+    const result = weaponCatalog.roll(
+      700,
+      false,
+      { pity: 0, upPity: 0, total: 0 },
+      new Set(),
+      selectedIds,
+      () => rolls.shift()!,
+    );
+    expect(result.awards[0]).toMatchObject({
+      nId: selectedIds[0],
+      isUp: true,
+    });
   });
 });

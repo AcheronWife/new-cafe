@@ -9,6 +9,7 @@ export type Gdpln = [...Gdpl, count: number];
 export interface GachaCard {
   id: number;
   gdpl: Gdpl;
+  rarity: number;
   rate: number;
   isPreview: boolean;
   upFlag: number;
@@ -181,7 +182,7 @@ function weightedPick<T>(
 }
 
 function cardStar(card: GachaCard): number {
-  return card.gdpl[3] >= 4 ? 4 : card.gdpl[3];
+  return card.rarity >= 4 ? 4 : card.rarity;
 }
 
 function groupCards(cards: readonly GachaCard[]): Map<number, GachaCard[]> {
@@ -204,6 +205,7 @@ function parseCards(contents: string): GachaCard[] {
       {
         id: integer(row.ID),
         gdpl,
+        rarity: integer(row.Rarity) || gdpl[3],
         rate,
         isPreview: integer(row.IsPreview) === 1,
         upFlag: integer(row.UpFlag),
@@ -261,6 +263,7 @@ export class GachaCatalog {
     starSeedContents: string,
     hedgeSeedContents: string,
     poolFiles: ReadonlyMap<string, string>,
+    poolType = 1,
   ) {
     for (const row of rows(starSeedContents)) {
       const byStar = new Map<number, readonly ThresholdWeight[]>();
@@ -282,7 +285,7 @@ export class GachaCatalog {
 
     const latestRows = new Map<number, ParsedPoolRow>();
     for (const row of rows(gachaContents)) {
-      if (integer(row.Type) !== 1) continue;
+      if (integer(row.Type) !== poolType) continue;
       const parsed: ParsedPoolRow = {
         id: integer(row.ID),
         name: row.Name ?? "",
@@ -330,7 +333,7 @@ export class GachaCatalog {
     }
   }
 
-  static loadDefault(): GachaCatalog {
+  static loadDefault(poolType = 1): GachaCatalog {
     const root = path.resolve(process.cwd(), "resources/gacha");
     const poolsRoot = path.join(root, "pools");
     const poolFiles = new Map(
@@ -346,6 +349,7 @@ export class GachaCatalog {
       readFileSync(path.join(root, "cardstarseed.txt"), "utf8"),
       readFileSync(path.join(root, "hedgecardseed.txt"), "utf8"),
       poolFiles,
+      poolType,
     );
   }
 
@@ -404,7 +408,7 @@ export class GachaCatalog {
     const starSeed = this.#starSeeds.get(pool.starSeedId);
     if (!starSeed) throw new Error(`Missing CardStarSeed ${pool.starSeedId}`);
     const normalCards =
-      pool.judgeType === 3
+      pool.judgeType === 3 || (pool.judgeType === 1 && selectedUpIds.length > 0)
         ? normalizeCustomUp(pool.normalCards, selectedUpIds)
         : pool.normalCards;
     const hedgeSeed = this.#hedgeSeeds.get(pool.hedgeSeedId);

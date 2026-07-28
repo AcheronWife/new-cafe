@@ -49,6 +49,7 @@ describe("card enhancement data", () => {
       particular: 1,
       templateLevel: 1,
       experience: 750,
+      coinCost: 500,
     });
     expect(CARD_EXP_MATERIALS.get(6)).toMatchObject({
       particular: 4,
@@ -58,6 +59,7 @@ describe("card enhancement data", () => {
       particular: 4,
       templateLevel: 2,
       experience: 3_750,
+      coinCost: 2_500,
     });
   });
 

@@ -8,6 +8,7 @@ import {
   makeMoneyUpdateNotification,
   makePhoneMessageNotification,
   makePlayerNotification,
+  makePlayerUpdateNotification,
   makeServerLuaCall,
   makeTaskValueSync,
   makeVerifyResponse,
@@ -138,6 +139,22 @@ describe("game protocol", () => {
     expect(packet.command).toBe(1048);
     expect(packet.serial).toBe(7);
     expect(packet.payload).toEqual(payload);
+  });
+
+  it("encodes level and residual experience in PlayerDataNtf", () => {
+    const fields = decodeFields(
+      makePlayerUpdateNotification({ ...rosterPlayer, level: 4, exp: 4 }),
+    );
+    expect(
+      fields
+        .filter(({ fieldNumber }) => fieldNumber === 1)
+        .map(({ value }) => Number(value)),
+    ).toEqual([1, 2]);
+    expect(
+      fields
+        .filter(({ fieldNumber }) => fieldNumber === 2)
+        .map(({ value }) => Number(value)),
+    ).toEqual([4, 4]);
   });
 
   it("encodes the initial cafe, rest and dorm rooms", () => {

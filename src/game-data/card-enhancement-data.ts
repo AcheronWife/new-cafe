@@ -19,6 +19,7 @@ export interface ExpMaterialDefinition {
   particular: number;
   templateLevel: number;
   experience: number;
+  coinCost: number;
 }
 
 const EXP_CARD_PARTICULARS = [1, 2, 3, 5, 6, 4] as const;
@@ -30,7 +31,8 @@ const CLIENT_SELECTABLE_EXP_RATE = 1.5;
  *
  * The shipped UI only exposes same-attribute and generic experience materials.
  * Both use CardCommon.SameAttrEXPRate (1.5), so these are the exact experience
- * values shown in the client before it sends Card_LevelUpCommon.
+ * values shown in the client before it sends Card_LevelUpCommon. ItemList's
+ * ExtParam2 is the per-material coin cost and is not affected by that rate.
  */
 export const CARD_EXP_MATERIALS: ReadonlyMap<number, ExpMaterialDefinition> = new Map(
   EXP_CARD_BASE_EXPERIENCE.flatMap((baseExperience, tierIndex) =>
@@ -42,6 +44,7 @@ export const CARD_EXP_MATERIALS: ReadonlyMap<number, ExpMaterialDefinition> = ne
         particular,
         templateLevel: tierIndex + 1,
         experience: Math.floor(baseExperience * CLIENT_SELECTABLE_EXP_RATE),
+        coinCost: baseExperience,
       },
     ]),
   ),

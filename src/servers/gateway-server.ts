@@ -40,6 +40,7 @@ import {
 } from "../game-data/phone-message-data.js";
 import type { Logger } from "../logger.js";
 import {
+  InsufficientGoldError,
   InsufficientVigourError,
   InsufficientGachaCurrencyError,
   EightDaySignUpError,
@@ -63,6 +64,7 @@ import {
   makeServerLuaCall,
   makeTaskValueSync,
   makeVerifyResponse,
+  makePlayerUpdateNotification,
   parseRenameName,
   parseTaskChanges,
 } from "../protocol/messages.js";
@@ -252,8 +254,10 @@ export function createGatewayServer({
 }: GatewayServerOptions): Server {
   const chapterCatalog = ChapterCatalog.loadDefault();
   const gachaCatalog = GachaCatalog.loadDefault();
+  const weaponGachaCatalog = GachaCatalog.loadDefault(0);
   logger.info("game_data.chapter.loaded", { levels: chapterCatalog.size });
   logger.info("game_data.gacha.loaded", { pools: gachaCatalog.size });
+  logger.info("game_data.weapon_gacha.loaded", { pools: weaponGachaCatalog.size });
   return createServer((socket) => {
     const peer = peerName(socket);
     const context: ConnectionContext = {
@@ -682,6 +686,164 @@ export function createGatewayServer({
           }
           return;
         }
+        if (call?.method === "WeaponLogicMsg") {
+          const parameters =
+            call.parameters && typeof call.parameters === "object"
+              ? (call.parameters as Record<string, unknown>)
+              : {};
+          const weaponCommand = Number(parameters.nCmd);
+          if (weaponCommand === 0) {
+            const poolId = Number(parameters.Id);
+            const ten = parameters.isTen === true;
+            const pool = weaponGachaCatalog.get(poolId);
+            if (!pool) {
+              send(
+                COMMAND.NTF_S2C_CALL,
+                0,
+                makeServerLuaCall("WeaponLogicMsg", {
+                  nError: 20096,
+                  nCmd: weaponCommand,
+                }),
+              );
+              logger.warn("weapon_gacha.pool_not_found", {
+                account: context.account,
+                poolId,
+              });
+              return;
+            }
+            const currentPlayer =
+              context.player ?? (await players.getOrCreate(context.account));
+            const pity =
+              currentPlayer.taskValues[String(makeGachaTaskId(1002 + poolId))] ?? 0;
+            const total = currentPlayer.taskValues[String(makeGachaTaskId(1001))] ?? 0;
+            const selectedPacked =
+              currentPlayer.taskValues[String(makeGachaTaskId(4001 + poolId))] ?? 0;
+            const selectedUpIds = [
+              selectedPacked & 0xffff,
+              (selectedPacked >>> 16) & 0xffff,
+            ].filter((id) => id > 0);
+            const ownedWeapons = new Set(
+              currentPlayer.inventory
+                .filter(({ genre }) => genre === 2)
+                .map(
+                  ({ genre, detail, particular, templateLevel }) =>
+                    `${genre}:${detail}:${particular}:${templateLevel}`,
+                ),
+            );
+            try {
+              const roll = weaponGachaCatalog.roll(
+                poolId,
+                ten,
+                { pity, upPity: 0, total },
+                ownedWeapons,
+                selectedUpIds,
+              );
+              const result = await players.performGacha(
+                context.account,
+                pool,
+                ten,
+                roll,
+                false,
+                "weapon",
+              );
+              context.player = result.player;
+              if (result.updatedItems.length > 0) {
+                send(
+                  COMMAND.ITEM_UPDATE_NTF,
+                  0,
+                  makeItemUpdateNotification(result.updatedItems),
+                );
+              }
+              for (const money of result.updatedMoney) {
+                send(COMMAND.MONEY_UPDATE_NTF, 0, makeMoneyUpdateNotification(money));
+              }
+              send(
+                COMMAND.TASK_VALUE_RSP,
+                0,
+                makeTaskValueSync(result.player.taskValues),
+              );
+              const weapons = result.updatedItems
+                .filter(({ genre }) => genre === 2)
+                .map(({ guid }) => ({ nGuid: guid }));
+              send(
+                COMMAND.NTF_S2C_CALL,
+                0,
+                makeServerLuaCall("WeaponLogicMsg", {
+                  nError: 0,
+                  nCmd: weaponCommand,
+                  tbParam: weapons,
+                }),
+              );
+              logger.info("weapon_gacha.response", {
+                account: context.account,
+                poolId,
+                ten,
+                awards: result.awards.length,
+                weaponGuids: weapons.map(({ nGuid }) => nGuid),
+              });
+            } catch (error) {
+              if (!(error instanceof InsufficientGachaCurrencyError)) throw error;
+              send(
+                COMMAND.NTF_S2C_CALL,
+                0,
+                makeServerLuaCall("WeaponLogicMsg", {
+                  nError: 1,
+                  nCmd: weaponCommand,
+                }),
+              );
+              logger.warn("weapon_gacha.insufficient_currency", {
+                account: context.account,
+                poolId,
+              });
+            }
+            return;
+          }
+        }
+        if (call?.method === "SetWeaponCustomUp") {
+          const parameters =
+            call.parameters && typeof call.parameters === "object"
+              ? (call.parameters as Record<string, unknown>)
+              : {};
+          const poolId = Number(parameters.nId);
+          const pool = weaponGachaCatalog.get(poolId);
+          const availableIds = new Set(
+            [...(pool?.normalCards.get(4) ?? [])].map(({ id }) => id),
+          );
+          const itemIds = [
+            ...new Set(
+              (Array.isArray(parameters.tbItems) ? parameters.tbItems : [])
+                .map(Number)
+                .filter(
+                  (id) => Number.isSafeInteger(id) && id > 0 && availableIds.has(id),
+                ),
+            ),
+          ].slice(0, 2);
+          if (!pool || pool.judgeType !== 1 || itemIds.length !== 2) {
+            logger.warn("weapon_gacha.custom_up.rejected", {
+              account: context.account,
+              poolId,
+              itemIds,
+            });
+            return;
+          }
+          context.player = await players.setWeaponGachaCustomUp(
+            context.account,
+            poolId,
+            itemIds,
+          );
+          send(COMMAND.TASK_VALUE_RSP, 0, makeTaskValueSync(context.player.taskValues));
+          send(
+            COMMAND.NTF_S2C_CALL,
+            0,
+            makeServerLuaCall("SetWeaponCustomUp", { nId: poolId }),
+          );
+          logger.info("weapon_gacha.custom_up.updated", {
+            account: context.account,
+            poolId,
+            itemIds,
+          });
+          return;
+        }
         if (call?.method === "GetLastGacha") {
           const currentPlayer =
             context.player ?? (await players.getOrCreate(context.account));
@@ -1031,17 +1193,41 @@ export function createGatewayServer({
             });
             return;
           }
-          const result = await players.enhanceCard(
-            context.account,
-            request.guid,
-            request.materials,
-          );
+          let result;
+          try {
+            result = await players.enhanceCard(
+              context.account,
+              request.guid,
+              request.materials,
+            );
+          } catch (error) {
+            if (!(error instanceof InsufficientGoldError)) throw error;
+            send(
+              COMMAND.NTF_S2C_CALL,
+              0,
+              makeServerLuaCall("LuaCall", {
+                sCmd: LUA_COMMAND_CARD_LEVEL_UP_COMMON,
+                tbParam: { errorKey: "Error.1" },
+              }),
+            );
+            logger.warn("card.enhance.insufficient_gold", {
+              peer,
+              account: context.account,
+              guid: request.guid,
+              required: error.required,
+              available: error.available,
+            });
+            return;
+          }
           context.player = result.player;
           send(
             COMMAND.ITEM_UPDATE_NTF,
             0,
             makeItemUpdateNotification([result.card, ...result.consumedItems]),
           );
+          for (const money of result.updatedMoney) {
+            send(COMMAND.MONEY_UPDATE_NTF, 0, makeMoneyUpdateNotification(money));
+          }
           send(
             COMMAND.NTF_S2C_CALL,
             0,
@@ -1058,6 +1244,7 @@ export function createGatewayServer({
             feature: "card.enhance",
             guid: request.guid,
             addedExperience: result.addedExperience,
+            coinCost: result.coinCost,
             level: result.card.enhanceLevel,
             experience: result.card.enhanceExp,
           });
@@ -1400,6 +1587,16 @@ export function createGatewayServer({
                   makeItemUpdateNotification(settlement.updatedItems),
                 );
               }
+              if (
+                settlement.experienceUpdate.addedExperience > 0 ||
+                settlement.experienceUpdate.levelsGained > 0
+              ) {
+                send(
+                  COMMAND.PLAYER_UPDATE_NTF,
+                  0,
+                  makePlayerUpdateNotification(settlement.player),
+                );
+              }
             }
             const response = {
               nError: 0,
@@ -1425,6 +1622,8 @@ export function createGatewayServer({
               awards,
               masterExp,
               cardExp,
+              playerLevel: context.player?.level,
+              playerExp: context.player?.exp,
             });
           } else if (isHeadTouchedCall(call)) {
             send(

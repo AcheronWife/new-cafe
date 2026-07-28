@@ -97,11 +97,23 @@ it("persists player and task changes atomically", async () => {
         [7, 1, 4, 1, 2, 100],
         [1, 2, 1, 1, 2, 100],
       ],
-      6,
+      36,
     );
     expect(settlement.player.levels).toEqual([{ id: 65_793, star: 11 }]);
-    expect(settlement.player.exp).toBe(6);
-    expect(settlement.updatedMoney).toEqual([{ id: 2, count: 1_000 }]);
+    expect(settlement.player).toMatchObject({ level: 4, exp: 4 });
+    expect(settlement.experienceUpdate).toEqual({
+      previousLevel: 1,
+      previousExperience: 0,
+      addedExperience: 36,
+      level: 4,
+      experience: 4,
+      levelsGained: 3,
+      vigourRecovery: 50,
+    });
+    expect(settlement.updatedMoney).toEqual([
+      { id: 1, count: 75 },
+      { id: 2, count: 1_000 },
+    ]);
     expect(settlement.updatedItems).toMatchObject([
       { genre: 7, detail: 1, particular: 4, templateLevel: 1, count: 2 },
       { genre: 1, detail: 2, particular: 1, templateLevel: 1, count: 1 },
@@ -140,6 +152,8 @@ it("persists player and task changes atomically", async () => {
     expect(enhancement.consumedItems).toMatchObject([
       { genre: 7, detail: 1, particular: 4, templateLevel: 1, count: 1 },
     ]);
+    expect(enhancement.coinCost).toBe(500);
+    expect(enhancement.updatedMoney).toEqual([{ id: 2, count: 500 }]);
     const completedPlayer = await repository.completeLevel("tester", 1, 1, 1, 5);
     expect(completedPlayer.levels).toEqual([{ id: 65_793, star: 23 }]);
     const letterPlayer = await repository.addPhoneLetter("tester", {
@@ -168,8 +182,8 @@ it("persists player and task changes atomically", async () => {
     expect(persisted.players.tester.taskValues["123"]).toBe(9);
     expect(persisted.players.tester.levels).toEqual([{ id: 65_793, star: 23 }]);
     expect(persisted.players.tester.money).toEqual([
-      { id: 1, count: 25 },
-      { id: 2, count: 1_000 },
+      { id: 1, count: 75 },
+      { id: 2, count: 500 },
       { id: 3, count: 0 },
     ]);
     expect(persisted.players.tester.cafe).toEqual({

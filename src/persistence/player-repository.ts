@@ -27,6 +27,7 @@ import type {
   GachaRollResult,
   Gdpln,
 } from "../game-data/gacha-data.js";
+import { addPlayerExperience } from "../game-data/player-level-data.js";
 import type { Logger } from "../logger.js";
 import type { JsonStore } from "./json-store.js";
 
@@ -181,6 +182,17 @@ export interface ChapterSettlement {
   player: Player;
   updatedItems: InventoryItemState[];
   updatedMoney: MoneyState[];
+  experienceUpdate: PlayerExperienceUpdate;
+}
+
+export interface PlayerExperienceUpdate {
+  previousLevel: number;
+  previousExperience: number;
+  addedExperience: number;
+  level: number;
+  experience: number;
+  levelsGained: number;
+  vigourRecovery: number;
 }
 
 export interface CardEnhancementResult {
@@ -188,6 +200,8 @@ export interface CardEnhancementResult {
   card: CharacterCardState;
   consumedItems: InventoryItemState[];
   addedExperience: number;
+  coinCost: number;
+  updatedMoney: MoneyState[];
 }
 
 export interface GachaCommitResult {
@@ -222,6 +236,16 @@ export class InsufficientVigourError extends Error {
   ) {
     super(`Insufficient vigour: required ${required}, available ${available}`);
     this.name = "InsufficientVigourError";
+  }
+}
+
+export class InsufficientGoldError extends Error {
+  constructor(
+    readonly required: number,
+    readonly available: number,
+  ) {
+    super(`Insufficient gold: required ${required}, available ${available}`);
+    this.name = "InsufficientGoldError";
   }
 }
 
@@ -261,6 +285,40 @@ function makeInitialPhoneState(): PhoneState {
 
 function makeInitialGachaState(): GachaState {
   return { pending: null };
+}
+
+function applyPlayerExperience(
+  player: Player,
+  addedExperience: number,
+): PlayerExperienceUpdate {
+  const previousLevel = player.level;
+  const previousExperience = player.exp;
+  const result = addPlayerExperience(
+    previousLevel,
+    previousExperience,
+    addedExperience,
+  );
+  player.level = result.level;
+  player.exp = result.experience;
+
+  if (result.vigourRecovery > 0) {
+    let vigour = player.money.find(({ id }) => id === MONEY_VIGOUR);
+    if (!vigour) {
+      vigour = { id: MONEY_VIGOUR, count: 0 };
+      player.money.push(vigour);
+    }
+    vigour.count += result.vigourRecovery;
+  }
+
+  return {
+    previousLevel,
+    previousExperience,
+    addedExperience: Math.max(
+      0,
+      Number.isSafeInteger(addedExperience) ? addedExperience : 0,
+    ),
+    ...result,
+  };
 }
 
 function makeInitialDailySignUpState(now = Date.now()): DailySignUpState {
@@ -412,7 +470,7 @@ function reconcileCharacterCardLevels(player: Player): void {
 }
 
 function initialEnhanceLevel(genre: number): number {
-  return genre === 1 ? 1 : 0;
+  return genre === 1 || genre === 2 ? 1 : 0;
 }
 
 function makeStarterRoster(
@@ -662,6 +720,13 @@ export class PlayerRepository {
         player.cafe ??= makeInitialCafeState();
         player.phone ??= migratePhoneState(player);
         player.gacha ??= makeInitialGachaState();
+        const experienceUpdate = applyPlayerExperience(player, 0);
+        if (experienceUpdate.levelsGained > 0) {
+          this.#logger.info("player.experience.reconciled", {
+            account: safeAccount,
+            ...experienceUpdate,
+          });
+        }
         reconcileCharacterCardLevels(player);
         reconcileDailySignUp(player);
         reconcileEightDaySignUp(player);
@@ -913,6 +978,7 @@ export class PlayerRepository {
     ten: boolean,
     roll: GachaRollResult,
     fromPending = false,
+    kind: "card" | "weapon" = "card",
   ): Promise<GachaCommitResult> {
     let player: Player | undefined;
     const updatedItemGuids = new Set<number>();
@@ -924,18 +990,25 @@ export class PlayerRepository {
       player.gacha ??= makeInitialGachaState();
       deductGachaCost(player, pool, ten, updatedItemGuids, updatedMoneyIds);
 
-      player.taskValues[String(makeGachaTaskId(2 + pool.id))] = roll.counters.pity;
-      if (pool.protectUpNum > 0) {
+      const pityTask = kind === "weapon" ? 1002 + pool.id : 2 + pool.id;
+      player.taskValues[String(makeGachaTaskId(pityTask))] = roll.counters.pity;
+      if (kind === "card" && pool.protectUpNum > 0) {
         player.taskValues[String(makeGachaTaskId(2001 + pool.id))] =
           roll.counters.upPity;
       }
-      player.taskValues[String(makeGachaTaskId(3001 + pool.id))] = roll.counters.total;
-      if (pool.rotateVersion > 0) {
+      if (kind === "card") {
+        player.taskValues[String(makeGachaTaskId(3001 + pool.id))] =
+          roll.counters.total;
+      }
+      if (kind === "card" && pool.rotateVersion > 0) {
         player.taskValues[String(makeGachaTaskId(10_005))] = pool.rotateVersion;
       }
-      player.taskValues[String(makeGachaTaskId(1))] =
-        (player.taskValues[String(makeGachaTaskId(1))] ?? 0) + roll.awards.length;
-      const operationTask = ten ? 10_002 : 10_001;
+      const totalTask = kind === "weapon" ? 1001 : 1;
+      player.taskValues[String(makeGachaTaskId(totalTask))] =
+        (player.taskValues[String(makeGachaTaskId(totalTask))] ?? 0) +
+        roll.awards.length;
+      const operationTask =
+        kind === "weapon" ? (ten ? 10_004 : 10_003) : ten ? 10_002 : 10_001;
       player.taskValues[String(makeGachaTaskId(operationTask))] =
         (player.taskValues[String(makeGachaTaskId(operationTask))] ?? 0) + 1;
 
@@ -968,6 +1041,7 @@ export class PlayerRepository {
     this.#logger.info("player.gacha.completed", {
       account,
       poolId: pool.id,
+      kind,
       ten,
       awards: roll.awards.map(({ nId, tbGDPL, isUp }) => ({
         nId,
@@ -1000,6 +1074,25 @@ export class PlayerRepository {
         id: makeGachaTaskId(7001 + poolId),
         value:
           (this.get(account)?.taskValues[String(makeGachaTaskId(7001 + poolId))] ?? 0) +
+          1,
+      },
+    ]);
+  }
+
+  async setWeaponGachaCustomUp(
+    account: string,
+    poolId: number,
+    itemIds: readonly number[],
+  ): Promise<Player> {
+    const low = itemIds[0] ?? 0;
+    const high = itemIds[1] ?? 0;
+    const packed = (low & 0xffff) | ((high & 0xffff) << 16);
+    return this.setTaskValues(account, [
+      { id: makeGachaTaskId(4001 + poolId), value: packed >>> 0 },
+      {
+        id: makeGachaTaskId(5001 + poolId),
+        value:
+          (this.get(account)?.taskValues[String(makeGachaTaskId(5001 + poolId))] ?? 0) +
           1,
       },
     ]);
@@ -1049,6 +1142,7 @@ export class PlayerRepository {
     let player: Player | undefined;
     let enhancedCard: CharacterCardState | undefined;
     let addedExperience = 0;
+    let coinCost = 0;
     const consumedItemGuids = new Set<number>();
     await this.#store.update((state) => {
       player = state.players[account];
@@ -1085,7 +1179,15 @@ export class PlayerRepository {
         item.count -= material.count;
         consumedItemGuids.add(item.guid);
         addedExperience += definition.experience * material.count;
+        coinCost += definition.coinCost * material.count;
       }
+
+      const gold = player.money.find(({ id }) => id === MONEY_GOLD);
+      const availableGold = gold?.count ?? 0;
+      if (availableGold < coinCost) {
+        throw new InsufficientGoldError(coinCost, availableGold);
+      }
+      if (gold) gold.count -= coinCost;
 
       const enhanced = addCardExperience(
         enhancedCard.enhanceLevel,
@@ -1103,6 +1205,7 @@ export class PlayerRepository {
       account,
       guid,
       addedExperience,
+      coinCost,
       level: enhancedCard.enhanceLevel,
       experience: enhancedCard.enhanceExp,
     });
@@ -1118,6 +1221,8 @@ export class PlayerRepository {
         consumedItemGuids.has(itemGuid),
       ),
       addedExperience,
+      coinCost,
+      updatedMoney: snapshot.money.filter(({ id }) => id === MONEY_GOLD),
     };
   }
 
@@ -1270,6 +1375,7 @@ export class PlayerRepository {
     const levelId = makeLevelId(chapter, index, difficulty);
     const starMask = star & 0b111;
     let player: Player | undefined;
+    let experienceUpdate: PlayerExperienceUpdate | undefined;
     const updatedItemGuids = new Set<number>();
     const updatedMoneyIds = new Set<number>();
     await this.#store.update((state) => {
@@ -1298,7 +1404,10 @@ export class PlayerRepository {
         });
       }
       state.schemaVersion = 9;
-      player.exp += Math.max(0, masterExp);
+      experienceUpdate = applyPlayerExperience(player, masterExp);
+      if (experienceUpdate.vigourRecovery > 0) {
+        updatedMoneyIds.add(MONEY_VIGOUR);
+      }
 
       for (const [genre, detail, particular, templateLevel, rawCount] of awards) {
         const count = Math.max(0, rawCount);
@@ -1368,6 +1477,7 @@ export class PlayerRepository {
       }
     });
     if (!player) throw new Error(`Failed to settle level: ${account}`);
+    if (!experienceUpdate) throw new Error(`Failed to update experience: ${account}`);
 
     this.#logger.info("player.level.settled", {
       account,
@@ -1375,12 +1485,14 @@ export class PlayerRepository {
       star: starMask,
       awards,
       masterExp,
+      experienceUpdate,
     });
     const snapshot = structuredClone(player);
     return {
       player: snapshot,
       updatedItems: snapshot.inventory.filter(({ guid }) => updatedItemGuids.has(guid)),
       updatedMoney: snapshot.money.filter(({ id }) => updatedMoneyIds.has(id)),
+      experienceUpdate,
     };
   }
 

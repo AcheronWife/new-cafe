@@ -15,6 +15,14 @@ const LEVELS = Object.freeze({
   error: 40,
 });
 
+const LEVEL_COLORS: Readonly<Record<LogLevel, string>> = Object.freeze({
+  debug: "\u001b[90m",
+  info: "\u001b[36m",
+  warn: "\u001b[33m",
+  error: "\u001b[31m",
+});
+const ANSI_RESET = "\u001b[0m";
+
 export type LogLevel = keyof typeof LEVELS;
 export type LogFields = Record<string, unknown>;
 
@@ -35,6 +43,19 @@ interface LoggerOptions {
 
 function jsonReplacer(_key: string, value: unknown): unknown {
   return typeof value === "bigint" ? value.toString() : value;
+}
+
+function terminalSupportsColor(entryLevel: LogLevel): boolean {
+  if (process.env.NO_COLOR !== undefined || process.env.FORCE_COLOR === "0") {
+    return false;
+  }
+  if (process.env.FORCE_COLOR !== undefined) return true;
+  return entryLevel === "error" ? process.stderr.isTTY : process.stdout.isTTY;
+}
+
+function formatLevel(entryLevel: LogLevel, color: boolean): string {
+  const label = entryLevel.toUpperCase().padEnd(5);
+  return color ? `${LEVEL_COLORS[entryLevel]}${label}${ANSI_RESET}` : label;
 }
 
 export function createLogger({
@@ -68,11 +89,16 @@ export function createLogger({
       Object.keys(fields).length === 0
         ? ""
         : ` ${JSON.stringify(fields, jsonReplacer)}`;
-    const line = `${new Date().toISOString()} ${entryLevel.toUpperCase().padEnd(5)} ${event}${suffix}`;
+    const timestamp = new Date().toISOString();
+    const line = `${timestamp} ${formatLevel(entryLevel, false)} ${event}${suffix}`;
+    const terminalLine = `${timestamp} ${formatLevel(
+      entryLevel,
+      terminalSupportsColor(entryLevel),
+    )} ${event}${suffix}`;
     if (entryLevel === "error") {
-      console.error(line);
+      console.error(terminalLine);
     } else {
-      console.log(line);
+      console.log(terminalLine);
     }
     const lineBytes = Buffer.byteLength(line) + 1;
     if (currentBytes > 0 && currentBytes + lineBytes > maxBytes) rotate();

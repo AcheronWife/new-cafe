@@ -82,6 +82,19 @@ export function makePlayerNotification(player: Player): Buffer {
 }
 
 /**
+ * PlayerDataNtf uses two parallel repeated fields. Update types 1 and 2 are
+ * player level and residual experience respectively.
+ */
+export function makePlayerUpdateNotification(player: Player): Buffer {
+  return Buffer.concat([
+    fieldVarint(1, 1),
+    fieldVarint(1, 2),
+    fieldVarint(2, player.level),
+    fieldVarint(2, player.exp),
+  ]);
+}
+
+/**
  * Encodes the login-time PhoneMsgNtf consumed by Game.PhoneMsgMgr.
  */
 export function makePhoneMessageNotification(player: Player): Buffer {
