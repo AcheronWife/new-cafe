@@ -45,6 +45,10 @@ it("persists player and task changes atomically", async () => {
     expect(player.name).toBe("");
     expect(player.lastLoginAt).toBeNull();
     expect(player.taskValues).toEqual({
+      "131074": 7,
+      "264145": 2,
+      "274145": 2,
+      "278145": 2,
       "1507329": 256,
       "1507330": 256,
       "1507331": 256,
@@ -79,6 +83,12 @@ it("persists player and task changes atomically", async () => {
     expect(loggedInPlayer.lastLoginAt).not.toBeNull();
     const renamedPlayer = await repository.rename("tester", "Commander");
     expect(renamedPlayer.name).toBe("Commander");
+    const mainGirlPlayer = await repository.setMainGirl("tester", 9);
+    expect(mainGirlPlayer.taskValues["131074"]).toBe(9);
+    const clothes = await repository.changeGirlClothes("tester", 9, 1);
+    expect(clothes.girl).toMatchObject({ girlId: 9, modelId: 1 });
+    const fightModelPlayer = await repository.setGirlFightModel("tester", 9, true);
+    expect(fightModelPlayer.taskValues["212617"]).toBe(1);
     await repository.setTaskValues("tester", [{ id: 123, value: 9 }]);
     const cafePlayer = await repository.makeCoffee("tester", 3, 240);
     expect(cafePlayer.cafe).toEqual({

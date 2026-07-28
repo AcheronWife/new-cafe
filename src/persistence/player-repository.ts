@@ -4,6 +4,13 @@ import {
   CARD_EXP_MATERIALS,
   type CardEnhancementMaterial,
 } from "../game-data/card-enhancement-data.js";
+import {
+  addWeaponExperience,
+  sacrificedWeaponValue,
+  weaponExperienceMaterial,
+  weaponMaximumLevel,
+  type WeaponEnhancementMaterial,
+} from "../game-data/weapon-enhancement-data.js";
 import { INITIAL_COFFEE_TASK_VALUES, type CafeCoffee } from "../game-data/cafe-data.js";
 import type { Award, BaseAward } from "../game-data/chapter-config.js";
 import {
@@ -25,6 +32,7 @@ import type {
   GachaAward,
   GachaPool,
   GachaRollResult,
+  Gdpl,
   Gdpln,
 } from "../game-data/gacha-data.js";
 import { addPlayerExperience } from "../game-data/player-level-data.js";
@@ -37,6 +45,12 @@ export const MONEY_GOLD = 2;
 export const MONEY_DIAMOND = 3;
 export const MONEY_PAY_DIAMOND = 12;
 export const GACHA_TASK_GROUP = 15;
+export const MAIN_GIRL_TASK_ID = (2 << 16) | 2;
+
+const GIRL_STATE_TASK_GROUP = 3;
+const GIRL_SUIT_TASK_GROUP = 4;
+const GIRL_TASK_STRIDE = 2_000;
+const GIRL_FIGHT_MODEL_OFFSET = 9;
 
 export function makeGachaTaskId(taskId: number): number {
   return (GACHA_TASK_GROUP << 16) | taskId;
@@ -64,6 +78,10 @@ export function isCharacterCard(
   entry: InventoryEntryState,
 ): entry is CharacterCardState {
   return entry.genre === 1;
+}
+
+export function isWeapon(entry: InventoryEntryState): boolean {
+  return entry.genre === 2;
 }
 
 export function isInventoryInstance(entry: InventoryEntryState): boolean {
@@ -195,9 +213,23 @@ export interface PlayerExperienceUpdate {
   vigourRecovery: number;
 }
 
+export interface GirlAppearanceResult {
+  player: Player;
+  girl: GirlState;
+}
+
 export interface CardEnhancementResult {
   player: Player;
   card: CharacterCardState;
+  consumedItems: InventoryItemState[];
+  addedExperience: number;
+  coinCost: number;
+  updatedMoney: MoneyState[];
+}
+
+export interface WeaponEnhancementResult {
+  player: Player;
+  weapon: InventoryItemState;
   consumedItems: InventoryItemState[];
   addedExperience: number;
   coinCost: number;
@@ -285,6 +317,33 @@ function makeInitialPhoneState(): PhoneState {
 
 function makeInitialGachaState(): GachaState {
   return { pending: null };
+}
+
+function makeGirlTaskId(group: number, girlId: number, offset: number): number {
+  return (group << 16) | ((girlId - 1) * GIRL_TASK_STRIDE + offset);
+}
+
+function reconcileGirlAppearanceState(player: Player): void {
+  const mainGirlId = player.taskValues[String(MAIN_GIRL_TASK_ID)] ?? 0;
+  if (!player.girls.some(({ girlId }) => girlId === mainGirlId)) {
+    const fallback = player.girls[0]?.girlId;
+    if (fallback !== undefined) {
+      player.taskValues[String(MAIN_GIRL_TASK_ID)] = fallback;
+    }
+  }
+
+  for (const girl of player.girls) {
+    // Obtaining a girl always unlocks her base suit. Preserve an existing
+    // "new" marker (1), otherwise store the client's worn marker (2).
+    const baseSuitTaskId = String(makeGirlTaskId(GIRL_SUIT_TASK_GROUP, girl.girlId, 1));
+    player.taskValues[baseSuitTaskId] ||= 2;
+
+    const currentModelId = Math.max(1, girl.modelId);
+    const currentSuitTaskId = String(
+      makeGirlTaskId(GIRL_SUIT_TASK_GROUP, girl.girlId, currentModelId),
+    );
+    player.taskValues[currentSuitTaskId] ||= 2;
+  }
 }
 
 function applyPlayerExperience(
@@ -728,6 +787,7 @@ export class PlayerRepository {
           });
         }
         reconcileCharacterCardLevels(player);
+        reconcileGirlAppearanceState(player);
         reconcileDailySignUp(player);
         reconcileEightDaySignUp(player);
         state.schemaVersion = 9;
@@ -764,6 +824,7 @@ export class PlayerRepository {
         ...makeStarterRoster(registerTime),
       };
       reconcileEightDaySignUp(player);
+      reconcileGirlAppearanceState(player);
       state.schemaVersion = 9;
       state.players[safeAccount] = player;
       this.#logger.info("player.created", { account: safeAccount, roleId });
@@ -800,6 +861,73 @@ export class PlayerRepository {
     });
     this.#logger.info("player.renamed", { account, name });
     if (!player) throw new Error(`Failed to rename player: ${account}`);
+    return structuredClone(player);
+  }
+
+  async setMainGirl(account: string, girlId: number): Promise<Player> {
+    let player: Player | undefined;
+    await this.#store.update((state) => {
+      player = state.players[account];
+      if (!player) throw new Error(`Unknown player account: ${account}`);
+      if (!player.girls.some((girl) => girl.girlId === girlId)) {
+        throw new Error(`Player does not own girl ${girlId}`);
+      }
+      player.taskValues[String(MAIN_GIRL_TASK_ID)] = girlId;
+    });
+    if (!player) throw new Error(`Failed to set main girl: ${account}`);
+    this.#logger.info("player.main_girl.updated", { account, girlId });
+    return structuredClone(player);
+  }
+
+  async changeGirlClothes(
+    account: string,
+    girlId: number,
+    modelId: number,
+  ): Promise<GirlAppearanceResult> {
+    let player: Player | undefined;
+    let girl: GirlState | undefined;
+    await this.#store.update((state) => {
+      player = state.players[account];
+      if (!player) throw new Error(`Unknown player account: ${account}`);
+      girl = player.girls.find((candidate) => candidate.girlId === girlId);
+      if (!girl) throw new Error(`Player does not own girl ${girlId}`);
+      const suitTaskId = String(makeGirlTaskId(GIRL_SUIT_TASK_GROUP, girlId, modelId));
+      if ((player.taskValues[suitTaskId] ?? 0) <= 0) {
+        throw new Error(`Player does not own girl ${girlId} model ${modelId}`);
+      }
+      girl.modelId = modelId;
+      player.taskValues[suitTaskId] = 2;
+    });
+    if (!player || !girl) throw new Error(`Failed to change girl clothes: ${account}`);
+    this.#logger.info("player.girl_clothes.updated", { account, girlId, modelId });
+    return { player: structuredClone(player), girl: structuredClone(girl) };
+  }
+
+  async setGirlFightModel(
+    account: string,
+    girlId: number,
+    enabled: boolean,
+  ): Promise<Player> {
+    let player: Player | undefined;
+    await this.#store.update((state) => {
+      player = state.players[account];
+      if (!player) throw new Error(`Unknown player account: ${account}`);
+      if (!player.girls.some((girl) => girl.girlId === girlId)) {
+        throw new Error(`Player does not own girl ${girlId}`);
+      }
+      const taskId = makeGirlTaskId(
+        GIRL_STATE_TASK_GROUP,
+        girlId,
+        GIRL_FIGHT_MODEL_OFFSET,
+      );
+      player.taskValues[String(taskId)] = enabled ? 1 : 0;
+    });
+    if (!player) throw new Error(`Failed to set girl fight model: ${account}`);
+    this.#logger.info("player.girl_fight_model.updated", {
+      account,
+      girlId,
+      enabled,
+    });
     return structuredClone(player);
   }
 
@@ -1217,6 +1345,144 @@ export class PlayerRepository {
     return {
       player: snapshot,
       card,
+      consumedItems: snapshot.inventory.filter(({ guid: itemGuid }) =>
+        consumedItemGuids.has(itemGuid),
+      ),
+      addedExperience,
+      coinCost,
+      updatedMoney: snapshot.money.filter(({ id }) => id === MONEY_GOLD),
+    };
+  }
+
+  async enhanceWeapon(
+    account: string,
+    guid: number,
+    materials: readonly WeaponEnhancementMaterial[],
+    rarityOf: (gdpl: Gdpl) => number | null,
+  ): Promise<WeaponEnhancementResult> {
+    let player: Player | undefined;
+    let enhancedWeapon: InventoryItemState | undefined;
+    let addedExperience = 0;
+    let coinCost = 0;
+    const consumedItemGuids = new Set<number>();
+    await this.#store.update((state) => {
+      player = state.players[account];
+      if (!player) throw new Error(`Unknown player account: ${account}`);
+      enhancedWeapon = player.inventory.find(
+        (entry) => entry.guid === guid && isWeapon(entry),
+      );
+      if (!enhancedWeapon) throw new Error(`Unknown weapon: ${guid}`);
+
+      const targetRarity = rarityOf([
+        enhancedWeapon.genre,
+        enhancedWeapon.detail,
+        enhancedWeapon.particular,
+        enhancedWeapon.templateLevel,
+      ]);
+      if (!targetRarity) throw new Error(`Unknown weapon rarity: ${guid}`);
+      const maximumLevel = weaponMaximumLevel(targetRarity, enhancedWeapon.breakLevel);
+      if (enhancedWeapon.enhanceLevel >= maximumLevel) {
+        throw new Error(`Weapon is already at its level cap: ${guid}`);
+      }
+
+      const equippedWeapons = new Set(
+        player.formations.flatMap(({ fightCards }) =>
+          fightCards.map(({ weaponGuid }) => weaponGuid),
+        ),
+      );
+      const evaluatedMaterials: Array<{
+        item: InventoryItemState;
+        count: number;
+        experience: number;
+        cost: number;
+      }> = [];
+      for (const material of materials) {
+        const item = player.inventory.find(
+          (candidate) => candidate.guid === material.guid,
+        );
+        if (!item || item.guid === guid || item.count < material.count) {
+          throw new Error(`Invalid weapon enhancement material: ${material.guid}`);
+        }
+
+        if (isWeapon(item)) {
+          if (material.count !== 1 || equippedWeapons.has(item.guid)) {
+            throw new Error(`Weapon cannot be consumed: ${material.guid}`);
+          }
+          const rarity = rarityOf([
+            item.genre,
+            item.detail,
+            item.particular,
+            item.templateLevel,
+          ]);
+          const value = rarity
+            ? sacrificedWeaponValue(item.enhanceLevel, rarity)
+            : null;
+          if (!value) throw new Error(`Unknown donor weapon: ${material.guid}`);
+          evaluatedMaterials.push({
+            item,
+            count: 1,
+            experience: value.experience,
+            cost: value.coinCost,
+          });
+          addedExperience += value.experience;
+          coinCost += value.coinCost;
+          continue;
+        }
+
+        const definition = weaponExperienceMaterial(item);
+        if (!definition) {
+          throw new Error(`Unsupported weapon material: ${material.guid}`);
+        }
+        evaluatedMaterials.push({
+          item,
+          count: material.count,
+          experience: definition.experience * material.count,
+          cost: definition.coinCost * material.count,
+        });
+        addedExperience += definition.experience * material.count;
+        coinCost += definition.coinCost * material.count;
+      }
+
+      const gold = player.money.find(({ id }) => id === MONEY_GOLD);
+      const availableGold = gold?.count ?? 0;
+      if (availableGold < coinCost) {
+        throw new InsufficientGoldError(coinCost, availableGold);
+      }
+      for (const material of evaluatedMaterials) {
+        material.item.count -= material.count;
+        consumedItemGuids.add(material.item.guid);
+      }
+      if (gold) gold.count -= coinCost;
+
+      const enhanced = addWeaponExperience(
+        enhancedWeapon.enhanceLevel,
+        enhancedWeapon.enhanceExp,
+        addedExperience,
+        maximumLevel,
+      );
+      enhancedWeapon.enhanceLevel = enhanced.level;
+      enhancedWeapon.enhanceExp = enhanced.experience;
+    });
+    if (!player || !enhancedWeapon) {
+      throw new Error(`Failed to enhance weapon: ${guid}`);
+    }
+
+    this.#logger.info("player.weapon.enhanced", {
+      account,
+      guid,
+      addedExperience,
+      coinCost,
+      level: enhancedWeapon.enhanceLevel,
+      experience: enhancedWeapon.enhanceExp,
+    });
+    const snapshot = structuredClone(player);
+    const weapon = snapshot.inventory.find(
+      (candidate) => candidate.guid === guid && isWeapon(candidate),
+    );
+    if (!weapon) throw new Error(`Enhanced weapon disappeared: ${guid}`);
+    return {
+      player: snapshot,
+      weapon,
       consumedItems: snapshot.inventory.filter(({ guid: itemGuid }) =>
         consumedItemGuids.has(itemGuid),
       ),

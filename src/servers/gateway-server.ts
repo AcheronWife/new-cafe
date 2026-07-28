@@ -6,6 +6,7 @@ import {
   LUA_COMMAND_CARD_LEVEL_UP_COMMON,
   parseCardEnhancementRequest,
 } from "../game-data/card-enhancement-data.js";
+import { parseWeaponEnhancementRequest } from "../game-data/weapon-enhancement-data.js";
 import {
   ChapterCatalog,
   effectiveEnergyCost,
@@ -58,6 +59,7 @@ import {
   makeItemNotification,
   makeItemUpdateNotification,
   makeFormationUpdateNotification,
+  makeGirlUpdateNotification,
   makeHouseInfoResponse,
   makeMoneyUpdateNotification,
   makePhoneMessageNotification,
@@ -145,6 +147,42 @@ function isHeadTouchedCall(call: LuaCall | null): call is LuaCall & {
     typeof parameters.nId === "number" &&
     typeof parameters.nType === "number"
   );
+}
+
+type GirlAppearanceCall =
+  | { command: "SetMainGirl"; girlId: number }
+  | { command: "ChangeCloth"; girlId: number; modelId: number }
+  | { command: "SetModelInFight"; girlId: number; enabled: boolean };
+
+function parseGirlAppearanceCall(call: LuaCall | null): GirlAppearanceCall | null {
+  if (
+    call?.method !== "GirlLogic" ||
+    typeof call.parameters !== "object" ||
+    call.parameters === null
+  ) {
+    return null;
+  }
+
+  const parameters = call.parameters as Record<string, unknown>;
+  const girlId = Number(parameters.nId);
+  if (!Number.isSafeInteger(girlId) || girlId <= 0) return null;
+
+  if (parameters.sCmd === "SetMainGirl") {
+    return { command: "SetMainGirl", girlId };
+  }
+  if (parameters.sCmd === "ChangeCloth") {
+    const modelId = Number(parameters.nSuit);
+    return Number.isSafeInteger(modelId) && modelId > 0
+      ? { command: "ChangeCloth", girlId, modelId }
+      : null;
+  }
+  if (parameters.sCmd === "SetModelInFight") {
+    const use = Number(parameters.nUse);
+    return use === 0 || use === 1
+      ? { command: "SetModelInFight", girlId, enabled: use === 1 }
+      : null;
+  }
+  return null;
 }
 
 interface FormationUpdateCall {
@@ -418,6 +456,7 @@ export function createGatewayServer({
       if (packet.command === COMMAND.C2S_CALL_REQ) {
         const call = parseLuaCall(packet.payload);
         const luaCommand = parseNumericLuaCommand(call);
+        const girlAppearanceCall = parseGirlAppearanceCall(call);
         logger.info("lua.call", {
           peer,
           account: context.account,
@@ -692,6 +731,73 @@ export function createGatewayServer({
               ? (call.parameters as Record<string, unknown>)
               : {};
           const weaponCommand = Number(parameters.nCmd);
+          if (weaponCommand === 1) {
+            const request = parseWeaponEnhancementRequest(parameters);
+            if (!request) {
+              send(
+                COMMAND.NTF_S2C_CALL,
+                0,
+                makeServerLuaCall("WeaponLogicMsg", {
+                  nError: 1,
+                  nCmd: weaponCommand,
+                }),
+              );
+              logger.warn("weapon.enhance.invalid_request", {
+                account: context.account,
+                parameters,
+              });
+              return;
+            }
+            try {
+              const result = await players.enhanceWeapon(
+                context.account,
+                request.guid,
+                request.materials,
+                (gdpl) => weaponGachaCatalog.rarityOf(gdpl),
+              );
+              context.player = result.player;
+              send(
+                COMMAND.ITEM_UPDATE_NTF,
+                0,
+                makeItemUpdateNotification([result.weapon, ...result.consumedItems]),
+              );
+              for (const money of result.updatedMoney) {
+                send(COMMAND.MONEY_UPDATE_NTF, 0, makeMoneyUpdateNotification(money));
+              }
+              send(
+                COMMAND.NTF_S2C_CALL,
+                0,
+                makeServerLuaCall("WeaponLogicMsg", {
+                  nError: 0,
+                  nCmd: weaponCommand,
+                }),
+              );
+              logger.info("weapon.enhance.response", {
+                account: context.account,
+                guid: request.guid,
+                materials: request.materials,
+                addedExperience: result.addedExperience,
+                coinCost: result.coinCost,
+                level: result.weapon.enhanceLevel,
+                experience: result.weapon.enhanceExp,
+              });
+            } catch (error) {
+              send(
+                COMMAND.NTF_S2C_CALL,
+                0,
+                makeServerLuaCall("WeaponLogicMsg", {
+                  nError: 1,
+                  nCmd: weaponCommand,
+                }),
+              );
+              logger.warn("weapon.enhance.rejected", {
+                account: context.account,
+                guid: request.guid,
+                error: error instanceof Error ? error.message : String(error),
+              });
+            }
+            return;
+          }
           if (weaponCommand === 0) {
             const poolId = Number(parameters.Id);
             const ten = parameters.isTen === true;
@@ -1624,6 +1730,59 @@ export function createGatewayServer({
               cardExp,
               playerLevel: context.player?.level,
               playerExp: context.player?.exp,
+            });
+          } else if (girlAppearanceCall) {
+            let callback: Record<string, unknown>;
+            if (girlAppearanceCall.command === "SetMainGirl") {
+              context.player = await players.setMainGirl(
+                context.account,
+                girlAppearanceCall.girlId,
+              );
+              send(
+                COMMAND.TASK_VALUE_RSP,
+                0,
+                makeTaskValueSync(context.player.taskValues),
+              );
+              callback = {
+                sCmd: girlAppearanceCall.command,
+                nId: girlAppearanceCall.girlId,
+              };
+            } else if (girlAppearanceCall.command === "ChangeCloth") {
+              const result = await players.changeGirlClothes(
+                context.account,
+                girlAppearanceCall.girlId,
+                girlAppearanceCall.modelId,
+              );
+              context.player = result.player;
+              send(COMMAND.GIRL_UPDATE_NTF, 0, makeGirlUpdateNotification(result.girl));
+              callback = {
+                sCmd: girlAppearanceCall.command,
+                nId: girlAppearanceCall.girlId,
+                nSuit: girlAppearanceCall.modelId,
+              };
+            } else {
+              context.player = await players.setGirlFightModel(
+                context.account,
+                girlAppearanceCall.girlId,
+                girlAppearanceCall.enabled,
+              );
+              send(
+                COMMAND.TASK_VALUE_RSP,
+                0,
+                makeTaskValueSync(context.player.taskValues),
+              );
+              callback = {
+                sCmd: girlAppearanceCall.command,
+                nId: girlAppearanceCall.girlId,
+                nUse: girlAppearanceCall.enabled ? 1 : 0,
+                bSuccess: true,
+              };
+            }
+            send(COMMAND.NTF_S2C_CALL, 0, makeServerLuaCall("GirlLogic", callback));
+            logger.info("girl.appearance.updated", {
+              peer,
+              account: context.account,
+              ...girlAppearanceCall,
             });
           } else if (isHeadTouchedCall(call)) {
             send(

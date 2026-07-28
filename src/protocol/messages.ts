@@ -140,6 +140,10 @@ function makeGirlInfo(girl: GirlState): Buffer {
   ]);
 }
 
+export function makeGirlUpdateNotification(girl: GirlState): Buffer {
+  return fieldBytes(1, makeGirlInfo(girl));
+}
+
 function makeGirlList(girls: readonly GirlState[]): Buffer {
   return Buffer.concat(girls.map((girl) => fieldBytes(1, makeGirlInfo(girl))));
 }

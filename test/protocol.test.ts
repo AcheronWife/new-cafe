@@ -4,6 +4,7 @@ import {
   makeItemNotification,
   makeItemUpdateNotification,
   makeFormationUpdateNotification,
+  makeGirlUpdateNotification,
   makeHouseInfoResponse,
   makeMoneyUpdateNotification,
   makePhoneMessageNotification,
@@ -299,6 +300,29 @@ describe("game protocol", () => {
       [2, 0],
       [3, 0],
     ]);
+  });
+
+  it("encodes a single updated girl in GirlUpdateNtf", () => {
+    const outer = decodeFields(
+      makeGirlUpdateNotification({
+        girlId: 9,
+        level: 3,
+        exp: 12,
+        modelId: 2,
+        moodValue: 88,
+        vigor: 77,
+        flag: 1,
+      }),
+    );
+    expect(outer).toHaveLength(1);
+    const girl = decodeFields(outer[0]?.value as Buffer);
+    expect(firstNumber(girl, 1)).toBe(9);
+    expect(firstNumber(girl, 2)).toBe(3);
+    expect(firstNumber(girl, 3)).toBe(12);
+    expect(firstNumber(girl, 4)).toBe(2);
+    expect(firstNumber(girl, 5)).toBe(88);
+    expect(firstNumber(girl, 6)).toBe(77);
+    expect(firstNumber(girl, 7)).toBe(1);
   });
 
   it("encodes the three starter character cards in ItemNtf", () => {

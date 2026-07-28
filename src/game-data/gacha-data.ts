@@ -252,6 +252,7 @@ function normalizeCustomUp(
 
 export class GachaCatalog {
   readonly #pools = new Map<number, GachaPool>();
+  readonly #rarities = new Map<string, number>();
   readonly #starSeeds = new Map<
     number,
     ReadonlyMap<number, readonly ThresholdWeight[]>
@@ -325,10 +326,19 @@ export class GachaCatalog {
       const hedgeContents = hedge
         ? poolFiles.get(hedge.poolName.toLowerCase())
         : undefined;
+      const normalCards = groupCards(parseCards(normalContents));
+      const hedgeCards = hedgeContents
+        ? groupCards(parseCards(hedgeContents))
+        : new Map<number, GachaCard[]>();
+      for (const cards of [...normalCards.values(), ...hedgeCards.values()]) {
+        for (const card of cards) {
+          this.#rarities.set(card.gdpl.join(":"), card.rarity);
+        }
+      }
       this.#pools.set(row.id, {
         ...row,
-        normalCards: groupCards(parseCards(normalContents)),
-        hedgeCards: hedgeContents ? groupCards(parseCards(hedgeContents)) : new Map(),
+        normalCards,
+        hedgeCards,
       });
     }
   }
@@ -359,6 +369,10 @@ export class GachaCatalog {
 
   get size(): number {
     return this.#pools.size;
+  }
+
+  rarityOf(gdpl: Gdpl): number | null {
+    return this.#rarities.get(gdpl.join(":")) ?? null;
   }
 
   get ids(): number[] {
