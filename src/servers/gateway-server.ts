@@ -1,6 +1,7 @@
 import { createServer, type Server, type Socket } from "node:net";
 
 import type { AppConfig } from "../config.js";
+import { makeBackgroundLuaResponse } from "../game-data/background-lua-data.js";
 import {
   LUA_COMMAND_CARD_LEVEL_UP_COMMON,
   parseCardEnhancementRequest,
@@ -31,6 +32,10 @@ import {
   LUA_COMMAND_SHOP_GOODS_LIST,
   makeShopGoodsListResponse,
 } from "../game-data/shop-data.js";
+import {
+  getPhoneLetterDefinition,
+  makePhoneReplyId,
+} from "../game-data/phone-message-data.js";
 import type { Logger } from "../logger.js";
 import {
   InsufficientVigourError,
@@ -48,6 +53,7 @@ import {
   makeFormationUpdateNotification,
   makeHouseInfoResponse,
   makeMoneyUpdateNotification,
+  makePhoneMessageNotification,
   makeServerLuaCall,
   makeTaskValueSync,
   makeVerifyResponse,
@@ -331,6 +337,12 @@ export function createGatewayServer({
         send(COMMAND.PLAYER_NTF, 0, makePlayerNotification(context.player));
         await new Promise((resolve) => setTimeout(resolve, 20));
         send(COMMAND.ITEM_NTF, 0, makeItemNotification(context.player));
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        send(
+          COMMAND.PHONE_MSG_NTF,
+          0,
+          makePhoneMessageNotification(context.player),
+        );
         await new Promise((resolve) => setTimeout(resolve, 40));
         send(COMMAND.LOGIN_RSP, packet.serial);
         return;
@@ -404,6 +416,153 @@ export function createGatewayServer({
           ...(call ? { method: call.method, json: call.json } : {}),
         });
         send(COMMAND.C2S_CALL_RSP, packet.serial);
+        if (call?.method === "PhoneMsg") {
+          const parameters = call.parameters as Record<string, unknown> | undefined;
+          const phoneCommand = Number(parameters?.nCmd);
+          if (phoneCommand === 8) {
+            send(
+              COMMAND.NTF_S2C_CALL,
+              0,
+              makeServerLuaCall("ServerPhoneMsg", {
+                nCmd: 8,
+                tbList: [],
+              }),
+            );
+            logger.info("lua.callback", {
+              peer,
+              account: context.account,
+              method: "ServerPhoneMsg",
+              command: phoneCommand,
+              feature: "phone.bbs_publishable_list",
+            });
+          } else if (phoneCommand === 3) {
+            const topicId = Number(parameters?.nMsgId);
+            const selectionId = Number(parameters?.nSelectId);
+            const definition = getPhoneLetterDefinition(topicId);
+            const currentPlayer =
+              context.player ?? (await players.getOrCreate(context.account));
+            const letter = currentPlayer.phone.letters.find(
+              (candidate) => candidate.topicId === topicId,
+            );
+            const replyId =
+              definition && letter
+                ? makePhoneReplyId(
+                    definition,
+                    selectionId,
+                    letter.replyIds,
+                  )
+                : null;
+            if (replyId !== null) {
+              context.player = await players.replyToPhoneLetter(
+                context.account,
+                topicId,
+                replyId,
+              );
+            }
+            if (!definition) {
+              logger.warn("phone.letter_definition_missing", {
+                account: context.account,
+                topicId,
+              });
+              return;
+            }
+            send(
+              COMMAND.NTF_S2C_CALL,
+              0,
+              makeServerLuaCall("ServerPhoneMsg", {
+                nCmd: 3,
+                nNpcId: definition.initiator,
+                nMsgId: topicId,
+                nSelectId: selectionId,
+              }),
+            );
+            logger.info("lua.callback", {
+              peer,
+              account: context.account,
+              method: "ServerPhoneMsg",
+              command: phoneCommand,
+              feature: "phone.letter_reply",
+              topicId,
+              selectionId,
+              replyId,
+            });
+          } else if (phoneCommand === 10) {
+            const topicId = Number(parameters?.nMsgId);
+            const definition = getPhoneLetterDefinition(topicId);
+            if (!definition) {
+              logger.warn("phone.letter_definition_missing", {
+                account: context.account,
+                topicId,
+              });
+              return;
+            }
+            context.player = await players.removePhoneLetter(
+              context.account,
+              topicId,
+            );
+            send(
+              COMMAND.NTF_S2C_CALL,
+              0,
+              makeServerLuaCall("ServerPhoneMsg", {
+                nCmd: 10,
+                nNpcId: definition.initiator,
+                nMsgId: topicId,
+              }),
+            );
+            logger.info("lua.callback", {
+              peer,
+              account: context.account,
+              method: "ServerPhoneMsg",
+              command: phoneCommand,
+              feature: "phone.letter_delete",
+              topicId,
+            });
+          } else if (phoneCommand === 11) {
+            const topicId = Number(parameters?.nMsgId);
+            const definition = getPhoneLetterDefinition(topicId);
+            if (!definition) {
+              logger.warn("phone.letter_definition_missing", {
+                account: context.account,
+                topicId,
+              });
+              return;
+            }
+            context.player = await players.addPhoneLetter(context.account, {
+              topicId,
+              initiator: definition.initiator,
+            });
+            send(
+              COMMAND.PHONE_MSG_NTF,
+              0,
+              makePhoneMessageNotification(context.player),
+            );
+            send(
+              COMMAND.NTF_S2C_CALL,
+              0,
+              makeServerLuaCall("ServerPhoneMsg", {
+                nCmd: 11,
+                nNpcId: definition.initiator,
+                nMsgId: topicId,
+              }),
+            );
+            logger.info("lua.callback", {
+              peer,
+              account: context.account,
+              method: "ServerPhoneMsg",
+              command: phoneCommand,
+              feature: "phone.letter_add",
+              topicId,
+            });
+          } else {
+            logger.warn("phone.unhandled", {
+              peer,
+              account: context.account,
+              command: phoneCommand,
+              parameters,
+            });
+          }
+          return;
+        }
         if (luaCommand === LUA_COMMAND_WRITE_GUIDE_LOG) {
           const acknowledgement = makeGuideLogAcknowledgement(call?.parameters);
           if (acknowledgement) {
@@ -424,6 +583,28 @@ export function createGatewayServer({
               ...acknowledgement,
             });
           }
+          return;
+        }
+        const backgroundResponse = makeBackgroundLuaResponse(
+          luaCommand,
+          call?.parameters,
+        );
+        if (backgroundResponse !== undefined) {
+          send(
+            COMMAND.NTF_S2C_CALL,
+            0,
+            makeServerLuaCall("LuaCall", {
+              sCmd: luaCommand,
+              tbParam: backgroundResponse,
+            }),
+          );
+          logger.info("lua.callback", {
+            peer,
+            account: context.account,
+            method: "LuaCall",
+            command: luaCommand,
+            feature: "background.empty_state",
+          });
           return;
         }
         if (luaCommand === LUA_COMMAND_CARD_LEVEL_UP_COMMON) {
@@ -873,6 +1054,14 @@ export function createGatewayServer({
               account: context.account,
               method: call.method,
               command: call.parameters.sCmd,
+            });
+          } else {
+            logger.warn("lua.unhandled", {
+              peer,
+              account: context.account,
+              method: call?.method,
+              command: luaCommand,
+              parameters: call?.parameters,
             });
           }
         }

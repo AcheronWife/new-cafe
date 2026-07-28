@@ -6,6 +6,7 @@ import {
   makeFormationUpdateNotification,
   makeHouseInfoResponse,
   makeMoneyUpdateNotification,
+  makePhoneMessageNotification,
   makePlayerNotification,
   makeServerLuaCall,
   makeTaskValueSync,
@@ -97,7 +98,38 @@ describe("game protocol", () => {
     ],
     levels: [{ id: 65_793, star: 15 }],
     cafe: { coffees: [] },
+    phone: {
+      letters: [
+        {
+          topicId: 10_001,
+          initiator: 7,
+          createTime: 1,
+          replyIds: [],
+        },
+      ],
+    },
   };
+
+  it("encodes the 1-5 guide letter in PhoneMsgNtf", () => {
+    const phoneFields = decodeFields(makePhoneMessageNotification({
+      ...rosterPlayer,
+    }));
+    const letter = phoneFields[0]?.value;
+    expect(Buffer.isBuffer(letter)).toBe(true);
+    const letterFields = decodeFields(letter as Buffer);
+    expect(firstNumber(letterFields, 1)).toBe(7);
+    expect(firstNumber(letterFields, 3)).toBe(1);
+
+    const topic = letterFields.find(({ fieldNumber }) => fieldNumber === 4)?.value;
+    expect(Buffer.isBuffer(topic)).toBe(true);
+    expect(firstNumber(decodeFields(topic as Buffer), 1)).toBe(10_001);
+    expect(
+      makePhoneMessageNotification({
+        ...rosterPlayer,
+        phone: { letters: [] },
+      }),
+    ).toEqual(Buffer.alloc(0));
+  });
 
   it("round-trips the packet header", () => {
     const payload = Buffer.from("0801", "hex");
@@ -150,6 +182,7 @@ describe("game protocol", () => {
         formations: [],
         levels: [],
         cafe: { coffees: [] },
+        phone: { letters: [] },
       },
       {
         id: 1,
@@ -183,6 +216,7 @@ describe("game protocol", () => {
         formations: [],
         levels: [],
         cafe: { coffees: [] },
+        phone: { letters: [] },
       },
       {
         id: 1,

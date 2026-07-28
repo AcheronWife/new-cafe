@@ -23,6 +23,25 @@ describe("card enhancement data", () => {
     });
   });
 
+  it("unwraps the LuaCall envelope received by the gateway", () => {
+    expect(
+      parseCardEnhancementRequest({
+        sCmd: 5,
+        tbParam: {
+          guid: 10_003,
+          clientSkillLv: 0,
+          clientlv: 2,
+          items: [[1, 6, 1]],
+        },
+      }),
+    ).toEqual({
+      guid: 10_003,
+      clientLevel: 2,
+      clientSkillLevel: 0,
+      materials: [{ kind: 1, reference: 6, count: 1 }],
+    });
+  });
+
   it("maps client material indices in CardCommon order", () => {
     expect(CARD_EXP_MATERIALS.get(1)).toEqual({
       genre: 7,

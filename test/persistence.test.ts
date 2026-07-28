@@ -72,6 +72,7 @@ it("persists player and task changes atomically", async () => {
     ]);
     expect(player.items).toEqual([]);
     expect(player.cafe).toEqual({ coffees: [] });
+    expect(player.phone).toEqual({ letters: [] });
     const loggedInPlayer = await repository.markLogin("tester");
     expect(loggedInPlayer.lastLoginAt).not.toBeNull();
     const renamedPlayer = await repository.rename("tester", "Commander");
@@ -92,6 +93,7 @@ it("persists player and task changes atomically", async () => {
       [
         [15, 1, 1, 1, 1_000, 0],
         [7, 1, 4, 1, 2, 100],
+        [1, 2, 1, 1, 1, 100],
       ],
       6,
     );
@@ -100,7 +102,26 @@ it("persists player and task changes atomically", async () => {
     expect(settlement.updatedMoney).toEqual([{ id: 2, count: 1_000 }]);
     expect(settlement.updatedItems).toMatchObject([
       { genre: 7, detail: 1, particular: 4, templateLevel: 1, count: 2 },
+      { genre: 1, detail: 2, particular: 1, templateLevel: 1, count: 1 },
     ]);
+    const awardedCard = settlement.updatedItems.find(({ genre }) => genre === 1);
+    expect(awardedCard).toBeDefined();
+    const formationPlayer = await repository.updateFormation("tester", {
+      id: 2,
+      title: "",
+      fightCards: [
+        {
+          mainCardGuid: awardedCard?.guid ?? 0,
+          secondaryCardGuids: [],
+          usedCardGuid: 0,
+          weaponGuid: 0,
+          runeItemGuids: [],
+        },
+      ],
+    });
+    expect(formationPlayer.formations[1]?.fightCards[0]?.mainCardGuid).toBe(
+      awardedCard?.guid,
+    );
     const enhancement = await repository.enhanceCard("tester", 10_003, [
       { kind: 1, reference: 6, count: 1 },
     ]);
@@ -114,9 +135,32 @@ it("persists player and task changes atomically", async () => {
     ]);
     const completedPlayer = await repository.completeLevel("tester", 1, 1, 1, 5);
     expect(completedPlayer.levels).toEqual([{ id: 65_793, star: 23 }]);
+    const letterPlayer = await repository.addPhoneLetter("tester", {
+      topicId: 10_001,
+      initiator: 7,
+    });
+    expect(letterPlayer.phone.letters[0]).toMatchObject({
+      topicId: 10_001,
+      initiator: 7,
+      replyIds: [],
+    });
+    const repliedPlayer = await repository.replyToPhoneLetter(
+      "tester",
+      10_001,
+      21,
+    );
+    expect(repliedPlayer.phone.letters[0]?.replyIds).toEqual([21]);
+    await repository.removePhoneLetter("tester", 10_001);
+    const mysteryLetterPlayer = await repository.addPhoneLetter("tester", {
+      topicId: 1,
+      initiator: 111,
+    });
+    expect(mysteryLetterPlayer.phone.letters).toMatchObject([
+      { topicId: 1, initiator: 111, replyIds: [] },
+    ]);
 
     const persisted = JSON.parse(await readFile(filePath, "utf8"));
-    expect(persisted.schemaVersion).toBe(5);
+    expect(persisted.schemaVersion).toBe(6);
     expect(persisted.players.tester.name).toBe("Commander");
     expect(persisted.players.tester.taskValues["123"]).toBe(9);
     expect(persisted.players.tester.levels).toEqual([{ id: 65_793, star: 23 }]);
@@ -128,6 +172,9 @@ it("persists player and task changes atomically", async () => {
     expect(persisted.players.tester.cafe).toEqual({
       coffees: [{ coffeetype: 3, count: 240 }],
     });
+    expect(persisted.players.tester.phone.letters).toMatchObject([
+      { topicId: 1, initiator: 111, replyIds: [] },
+    ]);
     expect(persisted.players.tester.cards[2]).toMatchObject({
       guid: 10_003,
       enhanceLevel: 2,

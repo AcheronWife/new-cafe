@@ -58,7 +58,11 @@ export function parseCardEnhancementRequest(
   parameters: unknown,
 ): CardEnhancementRequest | null {
   if (typeof parameters !== "object" || parameters === null) return null;
-  const value = parameters as Record<string, unknown>;
+  const envelope = parameters as Record<string, unknown>;
+  const value =
+    typeof envelope.tbParam === "object" && envelope.tbParam !== null
+      ? (envelope.tbParam as Record<string, unknown>)
+      : envelope;
   const guid = Number(value.guid);
   const clientLevel = Number(value.clientlv);
   const clientSkillLevel = Number(value.clientSkillLv);

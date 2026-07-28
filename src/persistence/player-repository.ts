@@ -67,6 +67,17 @@ export interface CafeState {
   coffees: CafeCoffee[];
 }
 
+export interface PhoneLetterState {
+  topicId: number;
+  initiator: number;
+  createTime: number;
+  replyIds: number[];
+}
+
+export interface PhoneState {
+  letters: PhoneLetterState[];
+}
+
 export interface Player {
   account: string;
   roleId: number;
@@ -86,10 +97,11 @@ export interface Player {
   formations: FormationState[];
   levels: LevelState[];
   cafe: CafeState;
+  phone: PhoneState;
 }
 
 export interface PersistedState {
-  schemaVersion: 5;
+  schemaVersion: 6;
   nextRoleId: number;
   players: Record<string, Player>;
   updatedAt: string | null;
@@ -135,6 +147,50 @@ function unixTime(): number {
 
 function makeInitialCafeState(): CafeState {
   return { coffees: [] };
+}
+
+function makeInitialPhoneState(): PhoneState {
+  return { letters: [] };
+}
+
+function hasCompletedLevel(
+  levels: readonly LevelState[],
+  chapter: number,
+  index: number,
+  difficulty: number,
+): boolean {
+  const id = makeLevelId(chapter, index, difficulty);
+  return levels.some((level) => level.id === id && level.star >>> 3 > 0);
+}
+
+function migratePhoneState(player: Player): PhoneState {
+  // Schema 5 did not persist phone state. For old saves, reconstruct the most
+  // likely deterministic guide state from completed chapters.
+  if (hasCompletedLevel(player.levels, 1, 6, 1)) {
+    return {
+      letters: [
+        {
+          topicId: 1,
+          initiator: 111,
+          createTime: unixTime(),
+          replyIds: [],
+        },
+      ],
+    };
+  }
+  if (hasCompletedLevel(player.levels, 1, 5, 1)) {
+    return {
+      letters: [
+        {
+          topicId: 10_001,
+          initiator: 7,
+          createTime: unixTime(),
+          replyIds: [],
+        },
+      ],
+    };
+  }
+  return makeInitialPhoneState();
 }
 
 function makeStarterRoster(
@@ -229,7 +285,8 @@ export class PlayerRepository {
       player = state.players[safeAccount];
       if (player) {
         player.cafe ??= makeInitialCafeState();
-        state.schemaVersion = 5;
+        player.phone ??= migratePhoneState(player);
+        state.schemaVersion = 6;
         return;
       }
 
@@ -258,9 +315,10 @@ export class PlayerRepository {
           { id: MONEY_DIAMOND, count: 0 },
         ],
         cafe: makeInitialCafeState(),
+        phone: makeInitialPhoneState(),
         ...makeStarterRoster(registerTime),
       };
-      state.schemaVersion = 5;
+      state.schemaVersion = 6;
       state.players[safeAccount] = player;
       this.#logger.info("player.created", { account: safeAccount, roleId });
     });
@@ -339,7 +397,7 @@ export class PlayerRepository {
       } else {
         player.cafe.coffees.push({ coffeetype: coffeeType, count });
       }
-      state.schemaVersion = 5;
+      state.schemaVersion = 6;
     });
     this.#logger.info("player.cafe.coffee_made", {
       account,
@@ -432,7 +490,19 @@ export class PlayerRepository {
       player = state.players[account];
       if (!player) throw new Error(`Unknown player account: ${account}`);
 
-      const ownedCards = new Set(player.cards.map(({ guid }) => guid));
+      // Character cards can come from both the starter roster and chapter
+      // awards. Awarded inventory is stored in `items`, but the client exposes
+      // genre 1 entries through EquipManager.GetAllCard and may legitimately
+      // place their GUIDs in a formation.
+      const ownedCards = new Set([
+        ...player.cards.map(({ guid }) => guid),
+        ...player.items
+          .filter(({ genre }) => genre === 1)
+          .map(({ guid }) => guid),
+      ]);
+      const ownedInventory = new Set(
+        [...player.cards, ...player.items].map(({ guid }) => guid),
+      );
       for (const fightCard of formation.fightCards) {
         const referencedCards = [
           fightCard.mainCardGuid,
@@ -441,6 +511,15 @@ export class PlayerRepository {
         ].filter((guid) => guid > 0);
         if (referencedCards.some((guid) => !ownedCards.has(guid))) {
           throw new Error(`Formation ${formation.id} references an unknown card`);
+        }
+        const referencedEquipment = [
+          fightCard.weaponGuid,
+          ...fightCard.runeItemGuids,
+        ].filter((guid) => guid > 0);
+        if (referencedEquipment.some((guid) => !ownedInventory.has(guid))) {
+          throw new Error(
+            `Formation ${formation.id} references unknown equipment`,
+          );
         }
       }
 
@@ -456,6 +535,69 @@ export class PlayerRepository {
       formationId: formation.id,
     });
     if (!player) throw new Error(`Failed to update player formation: ${account}`);
+    return structuredClone(player);
+  }
+
+  async replyToPhoneLetter(
+    account: string,
+    topicId: number,
+    replyId: number,
+  ): Promise<Player> {
+    let player: Player | undefined;
+    await this.#store.update((state) => {
+      player = state.players[account];
+      if (!player) throw new Error(`Unknown player account: ${account}`);
+      player.phone ??= migratePhoneState(player);
+      const letter = player.phone.letters.find(
+        (candidate) => candidate.topicId === topicId,
+      );
+      if (letter && !letter.replyIds.includes(replyId)) {
+        letter.replyIds.push(replyId);
+      }
+      state.schemaVersion = 6;
+    });
+    if (!player) throw new Error(`Failed to reply to phone letter: ${account}`);
+    return structuredClone(player);
+  }
+
+  async removePhoneLetter(account: string, topicId: number): Promise<Player> {
+    let player: Player | undefined;
+    await this.#store.update((state) => {
+      player = state.players[account];
+      if (!player) throw new Error(`Unknown player account: ${account}`);
+      player.phone ??= migratePhoneState(player);
+      player.phone.letters = player.phone.letters.filter(
+        (letter) => letter.topicId !== topicId,
+      );
+      state.schemaVersion = 6;
+    });
+    if (!player) throw new Error(`Failed to remove phone letter: ${account}`);
+    return structuredClone(player);
+  }
+
+  async addPhoneLetter(
+    account: string,
+    letter: Omit<PhoneLetterState, "createTime" | "replyIds">,
+  ): Promise<Player> {
+    let player: Player | undefined;
+    await this.#store.update((state) => {
+      player = state.players[account];
+      if (!player) throw new Error(`Unknown player account: ${account}`);
+      player.phone ??= migratePhoneState(player);
+      if (
+        !player.phone.letters.some(
+          (candidate) => candidate.topicId === letter.topicId,
+        )
+      ) {
+        player.phone.letters.push({
+          ...letter,
+          createTime: unixTime(),
+          replyIds: [],
+        });
+      }
+      state.schemaVersion = 6;
+    });
+    if (!player) throw new Error(`Failed to add phone letter: ${account}`);
     return structuredClone(player);
   }
 
@@ -517,6 +659,21 @@ export class PlayerRepository {
       } else {
         player.levels.push({ id: levelId, star: (1 << 3) | starMask });
       }
+      player.phone ??= migratePhoneState(player);
+      if (
+        chapter === 1 &&
+        index === 5 &&
+        difficulty === 1 &&
+        !player.phone.letters.some(({ topicId }) => topicId === 10_001)
+      ) {
+        player.phone.letters.push({
+          topicId: 10_001,
+          initiator: 7,
+          createTime: unixTime(),
+          replyIds: [],
+        });
+      }
+      state.schemaVersion = 6;
       player.exp += Math.max(0, masterExp);
 
       for (const [genre, detail, particular, templateLevel, rawCount] of awards) {
@@ -628,7 +785,7 @@ export class PlayerRepository {
 
 export function makeInitialState(): PersistedState {
   return {
-    schemaVersion: 5,
+    schemaVersion: 6,
     nextRoleId: 1,
     players: {},
     updatedAt: null,

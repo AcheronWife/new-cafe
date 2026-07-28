@@ -82,6 +82,40 @@ export function makePlayerNotification(player: Player): Buffer {
   ]);
 }
 
+/**
+ * Encodes the login-time PhoneMsgNtf consumed by Game.PhoneMsgMgr.
+ */
+export function makePhoneMessageNotification(player: Player): Buffer {
+  const byInitiator = new Map<number, typeof player.phone.letters>();
+  for (const letter of player.phone.letters) {
+    const topics = byInitiator.get(letter.initiator) ?? [];
+    topics.push(letter);
+    byInitiator.set(letter.initiator, topics);
+  }
+
+  return Buffer.concat(
+    [...byInitiator.entries()].map(([initiator, topics]) => {
+      const latestCreateTime = Math.max(
+        player.registerTime,
+        ...topics.map(({ createTime }) => createTime),
+      );
+      const letter = Buffer.concat([
+        fieldVarint(1, initiator),
+        fieldVarint(3, latestCreateTime),
+        ...topics.map((topicState) => {
+          const topic = Buffer.concat([
+            fieldVarint(1, topicState.topicId),
+            ...topicState.replyIds.map((replyId) => fieldVarint(2, replyId)),
+          ]);
+          return fieldBytes(4, topic);
+        }),
+        fieldVarint(5, 0),
+      ]);
+      return fieldBytes(1, letter);
+    }),
+  );
+}
+
 function makeGirlInfo(girl: GirlState): Buffer {
   return Buffer.concat([
     fieldVarint(1, girl.girlId),
