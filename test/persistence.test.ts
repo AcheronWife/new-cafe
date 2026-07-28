@@ -44,7 +44,12 @@ it("persists player and task changes atomically", async () => {
     const player = await repository.getOrCreate("tester");
     expect(player.name).toBe("");
     expect(player.lastLoginAt).toBeNull();
-    expect(player.taskValues).toEqual({});
+    expect(player.taskValues).toEqual({
+      "1507329": 256,
+      "1507330": 256,
+      "1507331": 256,
+      "1507332": 256,
+    });
     expect(
       player.cards.map(({ genre, detail, particular, templateLevel }) => [
         genre,
@@ -66,11 +71,16 @@ it("persists player and task changes atomically", async () => {
       { id: 3, count: 0 },
     ]);
     expect(player.items).toEqual([]);
+    expect(player.cafe).toEqual({ coffees: [] });
     const loggedInPlayer = await repository.markLogin("tester");
     expect(loggedInPlayer.lastLoginAt).not.toBeNull();
     const renamedPlayer = await repository.rename("tester", "Commander");
     expect(renamedPlayer.name).toBe("Commander");
     await repository.setTaskValues("tester", [{ id: 123, value: 9 }]);
+    const cafePlayer = await repository.makeCoffee("tester", 3, 240);
+    expect(cafePlayer.cafe).toEqual({
+      coffees: [{ coffeetype: 3, count: 240 }],
+    });
     const enteredPlayer = await repository.enterLevel("tester", 3);
     expect(enteredPlayer.money[0]?.count).toBe(25);
     const settlement = await repository.settleLevel(
@@ -91,11 +101,22 @@ it("persists player and task changes atomically", async () => {
     expect(settlement.updatedItems).toMatchObject([
       { genre: 7, detail: 1, particular: 4, templateLevel: 1, count: 2 },
     ]);
+    const enhancement = await repository.enhanceCard("tester", 10_003, [
+      { kind: 1, reference: 6, count: 1 },
+    ]);
+    expect(enhancement.card).toMatchObject({
+      guid: 10_003,
+      enhanceLevel: 2,
+      enhanceExp: 17,
+    });
+    expect(enhancement.consumedItems).toMatchObject([
+      { genre: 7, detail: 1, particular: 4, templateLevel: 1, count: 1 },
+    ]);
     const completedPlayer = await repository.completeLevel("tester", 1, 1, 1, 5);
     expect(completedPlayer.levels).toEqual([{ id: 65_793, star: 23 }]);
 
     const persisted = JSON.parse(await readFile(filePath, "utf8"));
-    expect(persisted.schemaVersion).toBe(4);
+    expect(persisted.schemaVersion).toBe(5);
     expect(persisted.players.tester.name).toBe("Commander");
     expect(persisted.players.tester.taskValues["123"]).toBe(9);
     expect(persisted.players.tester.levels).toEqual([{ id: 65_793, star: 23 }]);
@@ -104,6 +125,14 @@ it("persists player and task changes atomically", async () => {
       { id: 2, count: 1_000 },
       { id: 3, count: 0 },
     ]);
+    expect(persisted.players.tester.cafe).toEqual({
+      coffees: [{ coffeetype: 3, count: 240 }],
+    });
+    expect(persisted.players.tester.cards[2]).toMatchObject({
+      guid: 10_003,
+      enhanceLevel: 2,
+      enhanceExp: 17,
+    });
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

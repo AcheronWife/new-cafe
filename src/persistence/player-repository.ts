@@ -1,4 +1,10 @@
 import type { AppConfig } from "../config.js";
+import {
+  addCardExperience,
+  CARD_EXP_MATERIALS,
+  type CardEnhancementMaterial,
+} from "../game-data/card-enhancement-data.js";
+import { INITIAL_COFFEE_TASK_VALUES, type CafeCoffee } from "../game-data/cafe-data.js";
 import type { Award } from "../game-data/chapter-config.js";
 import type { Logger } from "../logger.js";
 import type { JsonStore } from "./json-store.js";
@@ -57,6 +63,10 @@ export interface LevelState {
   star: number;
 }
 
+export interface CafeState {
+  coffees: CafeCoffee[];
+}
+
 export interface Player {
   account: string;
   roleId: number;
@@ -75,10 +85,11 @@ export interface Player {
   girls: GirlState[];
   formations: FormationState[];
   levels: LevelState[];
+  cafe: CafeState;
 }
 
 export interface PersistedState {
-  schemaVersion: 4;
+  schemaVersion: 5;
   nextRoleId: number;
   players: Record<string, Player>;
   updatedAt: string | null;
@@ -93,6 +104,13 @@ export interface ChapterSettlement {
   player: Player;
   updatedItems: InventoryItemState[];
   updatedMoney: MoneyState[];
+}
+
+export interface CardEnhancementResult {
+  player: Player;
+  card: CharacterCardState;
+  consumedItems: InventoryItemState[];
+  addedExperience: number;
 }
 
 export class InsufficientVigourError extends Error {
@@ -113,6 +131,10 @@ interface PlayerRepositoryOptions {
 
 function unixTime(): number {
   return Math.floor(Date.now() / 1000);
+}
+
+function makeInitialCafeState(): CafeState {
+  return { coffees: [] };
 }
 
 function makeStarterRoster(
@@ -205,7 +227,11 @@ export class PlayerRepository {
     let player: Player | undefined;
     await this.#store.update((state) => {
       player = state.players[safeAccount];
-      if (player) return;
+      if (player) {
+        player.cafe ??= makeInitialCafeState();
+        state.schemaVersion = 5;
+        return;
+      }
 
       const roleId = state.nextRoleId++;
       const registerTime = unixTime();
@@ -219,9 +245,10 @@ export class PlayerRepository {
         serverZone: this.#defaults.serverZone,
         registerTime,
         lastLoginAt: null,
-        taskValues: this.#defaults.firstLevelComplete
-          ? { [FIRST_LEVEL_TASK_ID]: 6 }
-          : {},
+        taskValues: {
+          ...INITIAL_COFFEE_TASK_VALUES,
+          ...(this.#defaults.firstLevelComplete ? { [FIRST_LEVEL_TASK_ID]: 6 } : {}),
+        },
         levels: [],
         items: [],
         nextItemGuid: 20_001,
@@ -230,9 +257,10 @@ export class PlayerRepository {
           { id: MONEY_GOLD, count: 0 },
           { id: MONEY_DIAMOND, count: 0 },
         ],
+        cafe: makeInitialCafeState(),
         ...makeStarterRoster(registerTime),
       };
-      state.schemaVersion = 4;
+      state.schemaVersion = 5;
       state.players[safeAccount] = player;
       this.#logger.info("player.created", { account: safeAccount, roleId });
     });
@@ -284,6 +312,118 @@ export class PlayerRepository {
     this.#logger.info("player.tasks.updated", { account, changes });
     if (!player) throw new Error(`Failed to update player tasks: ${account}`);
     return structuredClone(player);
+  }
+
+  async makeCoffee(
+    account: string,
+    coffeeType: number,
+    count: number,
+  ): Promise<Player> {
+    if (!Number.isSafeInteger(coffeeType) || coffeeType <= 0) {
+      throw new Error(`Invalid coffee type: ${coffeeType}`);
+    }
+    if (!Number.isSafeInteger(count) || count <= 0) {
+      throw new Error(`Invalid coffee count: ${count}`);
+    }
+
+    let player: Player | undefined;
+    await this.#store.update((state) => {
+      player = state.players[account];
+      if (!player) throw new Error(`Unknown player account: ${account}`);
+      player.cafe ??= makeInitialCafeState();
+      const coffee = player.cafe.coffees.find(
+        (candidate) => candidate.coffeetype === coffeeType,
+      );
+      if (coffee) {
+        coffee.count += count;
+      } else {
+        player.cafe.coffees.push({ coffeetype: coffeeType, count });
+      }
+      state.schemaVersion = 5;
+    });
+    this.#logger.info("player.cafe.coffee_made", {
+      account,
+      coffeeType,
+      count,
+    });
+    if (!player) throw new Error(`Failed to make coffee for: ${account}`);
+    return structuredClone(player);
+  }
+
+  async enhanceCard(
+    account: string,
+    guid: number,
+    materials: readonly CardEnhancementMaterial[],
+  ): Promise<CardEnhancementResult> {
+    let player: Player | undefined;
+    let enhancedCard: CharacterCardState | undefined;
+    let addedExperience = 0;
+    const consumedItemGuids = new Set<number>();
+    await this.#store.update((state) => {
+      player = state.players[account];
+      if (!player) throw new Error(`Unknown player account: ${account}`);
+      enhancedCard = player.cards.find((card) => card.guid === guid);
+      if (!enhancedCard) throw new Error(`Unknown character card: ${guid}`);
+
+      for (const material of materials) {
+        if (material.kind !== 1) {
+          throw new Error(
+            `Unsupported card enhancement material kind: ${material.kind}`,
+          );
+        }
+        const definition = CARD_EXP_MATERIALS.get(material.reference);
+        if (!definition) {
+          throw new Error(
+            `Unknown card experience material index: ${material.reference}`,
+          );
+        }
+        const item = player.items.find(
+          (candidate) =>
+            candidate.genre === definition.genre &&
+            candidate.detail === definition.detail &&
+            candidate.particular === definition.particular &&
+            candidate.templateLevel === definition.templateLevel,
+        );
+        if (!item || item.count < material.count) {
+          throw new Error(
+            `Insufficient card experience material: ${material.reference}`,
+          );
+        }
+        item.count -= material.count;
+        consumedItemGuids.add(item.guid);
+        addedExperience += definition.experience * material.count;
+      }
+
+      const enhanced = addCardExperience(
+        enhancedCard.enhanceLevel,
+        enhancedCard.enhanceExp,
+        addedExperience,
+      );
+      enhancedCard.enhanceLevel = enhanced.level;
+      enhancedCard.enhanceExp = enhanced.experience;
+    });
+    if (!player || !enhancedCard) {
+      throw new Error(`Failed to enhance character card: ${guid}`);
+    }
+
+    this.#logger.info("player.card.enhanced", {
+      account,
+      guid,
+      addedExperience,
+      level: enhancedCard.enhanceLevel,
+      experience: enhancedCard.enhanceExp,
+    });
+    const snapshot = structuredClone(player);
+    const card = snapshot.cards.find((candidate) => candidate.guid === guid);
+    if (!card) throw new Error(`Enhanced card disappeared: ${guid}`);
+    return {
+      player: snapshot,
+      card,
+      consumedItems: snapshot.items.filter(({ guid: itemGuid }) =>
+        consumedItemGuids.has(itemGuid),
+      ),
+      addedExperience,
+    };
   }
 
   async updateFormation(account: string, formation: FormationState): Promise<Player> {
@@ -488,7 +628,7 @@ export class PlayerRepository {
 
 export function makeInitialState(): PersistedState {
   return {
-    schemaVersion: 4,
+    schemaVersion: 5,
     nextRoleId: 1,
     players: {},
     updatedAt: null,

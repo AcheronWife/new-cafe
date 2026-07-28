@@ -4,6 +4,7 @@ import {
   makeItemNotification,
   makeItemUpdateNotification,
   makeFormationUpdateNotification,
+  makeHouseInfoResponse,
   makeMoneyUpdateNotification,
   makePlayerNotification,
   makeServerLuaCall,
@@ -95,6 +96,7 @@ describe("game protocol", () => {
       },
     ],
     levels: [{ id: 65_793, star: 15 }],
+    cafe: { coffees: [] },
   };
 
   it("round-trips the packet header", () => {
@@ -103,6 +105,12 @@ describe("game protocol", () => {
     expect(packet.command).toBe(1048);
     expect(packet.serial).toBe(7);
     expect(packet.payload).toEqual(payload);
+  });
+
+  it("encodes the initial cafe, rest and dorm rooms", () => {
+    expect(makeHouseInfoResponse(7).toString("hex")).toBe(
+      "0807120e08072202080122020802220208061a00",
+    );
   });
 
   it("encodes task sync and decodes task changes", () => {
@@ -141,6 +149,7 @@ describe("game protocol", () => {
         girls: [],
         formations: [],
         levels: [],
+        cafe: { coffees: [] },
       },
       {
         id: 1,
@@ -173,6 +182,7 @@ describe("game protocol", () => {
         girls: [],
         formations: [],
         levels: [],
+        cafe: { coffees: [] },
       },
       {
         id: 1,
@@ -233,10 +243,7 @@ describe("game protocol", () => {
       .filter((field) => field.fieldNumber === 5)
       .map((field) => decodeFields(field.value as Buffer));
     expect(
-      money.map((entry) => [
-        firstNumber(entry, 1),
-        firstNumber(entry, 2),
-      ]),
+      money.map((entry) => [firstNumber(entry, 1), firstNumber(entry, 2)]),
     ).toEqual([
       [1, 28],
       [2, 0],
@@ -288,9 +295,7 @@ describe("game protocol", () => {
     expect(firstNumber(encodedItem, 1)).toBe(20_001);
     expect(firstNumber(encodedItem, 6)).toBe(2);
 
-    const moneyFields = decodeFields(
-      makeMoneyUpdateNotification({ id: 1, count: 25 }),
-    );
+    const moneyFields = decodeFields(makeMoneyUpdateNotification({ id: 1, count: 25 }));
     const encodedMoney = decodeFields(moneyFields[0]?.value as Buffer);
     expect(firstNumber(encodedMoney, 1)).toBe(1);
     expect(firstNumber(encodedMoney, 2)).toBe(25);

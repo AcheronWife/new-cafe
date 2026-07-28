@@ -2,11 +2,35 @@ import { createServer, type Server, type Socket } from "node:net";
 
 import type { AppConfig } from "../config.js";
 import {
+  LUA_COMMAND_CARD_LEVEL_UP_COMMON,
+  parseCardEnhancementRequest,
+} from "../game-data/card-enhancement-data.js";
+import {
   ChapterCatalog,
   effectiveEnergyCost,
   rollChapterAwards,
   type ChapterLevelConfig,
 } from "../game-data/chapter-config.js";
+import {
+  LUA_COMMAND_CAFE_ADD_GUEST_WEIGHT,
+  LUA_COMMAND_CAFE_DATA,
+  LUA_COMMAND_CAFE_FURNITURE_COUNT,
+  LUA_COMMAND_CAFE_GENERATE_CUSTOMER,
+  LUA_COMMAND_CAFE_MAKE_COFFEE,
+  LUA_COMMAND_CAFE_SET_WAITER_LIST,
+  makeCafeCustomerQueue,
+  makeCafePetResponse,
+  makeCoffeeResponse,
+  makeInitialCafeData,
+} from "../game-data/cafe-data.js";
+import {
+  LUA_COMMAND_WRITE_GUIDE_LOG,
+  makeGuideLogAcknowledgement,
+} from "../game-data/guide-data.js";
+import {
+  LUA_COMMAND_SHOP_GOODS_LIST,
+  makeShopGoodsListResponse,
+} from "../game-data/shop-data.js";
 import type { Logger } from "../logger.js";
 import {
   InsufficientVigourError,
@@ -22,6 +46,7 @@ import {
   makeItemNotification,
   makeItemUpdateNotification,
   makeFormationUpdateNotification,
+  makeHouseInfoResponse,
   makeMoneyUpdateNotification,
   makeServerLuaCall,
   makeTaskValueSync,
@@ -196,6 +221,18 @@ function parseChapterCall(call: LuaCall | null): ChapterCall | null {
   return Number.isSafeInteger(state) ? { state, parameters } : null;
 }
 
+function parseNumericLuaCommand(call: LuaCall | null): number | null {
+  if (
+    call?.method !== "LuaCall" ||
+    typeof call.parameters !== "object" ||
+    call.parameters === null
+  ) {
+    return null;
+  }
+  const command = Number((call.parameters as Record<string, unknown>).sCmd);
+  return Number.isSafeInteger(command) ? command : null;
+}
+
 export function createGatewayServer({
   config,
   logger,
@@ -328,14 +365,302 @@ export function createGatewayServer({
         return;
       }
 
+      if (packet.command === COMMAND.GET_HOUSEINFO_REQ) {
+        const requestedRoleId = firstNumber(
+          decodeFields(packet.payload),
+          1,
+          context.player?.roleId ?? 1,
+        );
+        send(
+          COMMAND.GET_HOUSEINFO_RSP,
+          packet.serial,
+          makeHouseInfoResponse(requestedRoleId),
+        );
+        logger.info("house.info.response", {
+          peer,
+          account: context.account,
+          roleId: requestedRoleId,
+          furnitureCount: 0,
+        });
+        return;
+      }
+
+      if (packet.command === COMMAND.HOUSE_RANDOM_REQ) {
+        send(COMMAND.HOUSE_RANDOM_RSP, packet.serial);
+        logger.info("house.random.response", {
+          peer,
+          account: context.account,
+          roleCount: 0,
+        });
+        return;
+      }
+
       if (packet.command === COMMAND.C2S_CALL_REQ) {
         const call = parseLuaCall(packet.payload);
+        const luaCommand = parseNumericLuaCommand(call);
         logger.info("lua.call", {
           peer,
           account: context.account,
           ...(call ? { method: call.method, json: call.json } : {}),
         });
         send(COMMAND.C2S_CALL_RSP, packet.serial);
+        if (luaCommand === LUA_COMMAND_WRITE_GUIDE_LOG) {
+          const acknowledgement = makeGuideLogAcknowledgement(call?.parameters);
+          if (acknowledgement) {
+            send(
+              COMMAND.NTF_S2C_CALL,
+              0,
+              makeServerLuaCall("LuaCall", {
+                sCmd: LUA_COMMAND_WRITE_GUIDE_LOG,
+                tbParam: acknowledgement,
+              }),
+            );
+            logger.info("lua.callback", {
+              peer,
+              account: context.account,
+              method: "LuaCall",
+              command: LUA_COMMAND_WRITE_GUIDE_LOG,
+              feature: "guide.log",
+              ...acknowledgement,
+            });
+          }
+          return;
+        }
+        if (luaCommand === LUA_COMMAND_CARD_LEVEL_UP_COMMON) {
+          const request = parseCardEnhancementRequest(call?.parameters);
+          if (!request) {
+            send(
+              COMMAND.NTF_S2C_CALL,
+              0,
+              makeServerLuaCall("LuaCall", {
+                sCmd: LUA_COMMAND_CARD_LEVEL_UP_COMMON,
+                tbParam: { errorKey: "Error.1" },
+              }),
+            );
+            logger.warn("card.enhance.invalid_request", {
+              peer,
+              account: context.account,
+              parameters: call?.parameters,
+            });
+            return;
+          }
+          const currentPlayer =
+            context.player ?? (await players.getOrCreate(context.account));
+          const currentCard = currentPlayer.cards.find(
+            ({ guid }) => guid === request.guid,
+          );
+          if (currentCard?.enhanceLevel !== request.clientLevel) {
+            send(
+              COMMAND.NTF_S2C_CALL,
+              0,
+              makeServerLuaCall("LuaCall", {
+                sCmd: LUA_COMMAND_CARD_LEVEL_UP_COMMON,
+                tbParam: { errorKey: "Error.1" },
+              }),
+            );
+            logger.warn("card.enhance.level_mismatch", {
+              peer,
+              account: context.account,
+              guid: request.guid,
+              clientLevel: request.clientLevel,
+              serverLevel: currentCard?.enhanceLevel,
+            });
+            return;
+          }
+          const result = await players.enhanceCard(
+            context.account,
+            request.guid,
+            request.materials,
+          );
+          context.player = result.player;
+          send(
+            COMMAND.ITEM_UPDATE_NTF,
+            0,
+            makeItemUpdateNotification([result.card, ...result.consumedItems]),
+          );
+          send(
+            COMMAND.NTF_S2C_CALL,
+            0,
+            makeServerLuaCall("LuaCall", {
+              sCmd: LUA_COMMAND_CARD_LEVEL_UP_COMMON,
+              tbParam: {},
+            }),
+          );
+          logger.info("lua.callback", {
+            peer,
+            account: context.account,
+            method: "LuaCall",
+            command: LUA_COMMAND_CARD_LEVEL_UP_COMMON,
+            feature: "card.enhance",
+            guid: request.guid,
+            addedExperience: result.addedExperience,
+            level: result.card.enhanceLevel,
+            experience: result.card.enhanceExp,
+          });
+          return;
+        }
+        if (luaCommand === LUA_COMMAND_CAFE_DATA) {
+          const player = context.player ?? (await players.getOrCreate(context.account));
+          const cafeData = makeInitialCafeData(
+            Math.floor(Date.now() / 1000),
+            player.cafe.coffees,
+          );
+          send(
+            COMMAND.NTF_S2C_CALL,
+            0,
+            makeServerLuaCall("LuaCall", {
+              sCmd: LUA_COMMAND_CAFE_DATA,
+              tbParam: cafeData,
+            }),
+          );
+          logger.info("lua.callback", {
+            peer,
+            account: context.account,
+            method: "LuaCall",
+            command: LUA_COMMAND_CAFE_DATA,
+            feature: "cafe.data",
+          });
+          return;
+        }
+        if (luaCommand === LUA_COMMAND_CAFE_SET_WAITER_LIST) {
+          const parameters = call?.parameters as Record<string, unknown> | undefined;
+          const waiterList = Array.isArray(parameters?.tbParam)
+            ? parameters.tbParam
+            : [[], [], []];
+          send(
+            COMMAND.NTF_S2C_CALL,
+            0,
+            makeServerLuaCall("LuaCall", {
+              sCmd: LUA_COMMAND_CAFE_SET_WAITER_LIST,
+              tbParam: waiterList,
+            }),
+          );
+          logger.info("lua.callback", {
+            peer,
+            account: context.account,
+            method: "LuaCall",
+            command: LUA_COMMAND_CAFE_SET_WAITER_LIST,
+            feature: "cafe.waiter_list",
+          });
+          return;
+        }
+        if (luaCommand === LUA_COMMAND_CAFE_GENERATE_CUSTOMER) {
+          const customerQueue = makeCafeCustomerQueue(Math.floor(Date.now() / 1000));
+          send(
+            COMMAND.NTF_S2C_CALL,
+            0,
+            makeServerLuaCall("LuaCall", {
+              sCmd: LUA_COMMAND_CAFE_GENERATE_CUSTOMER,
+              tbParam: customerQueue,
+            }),
+          );
+          logger.info("lua.callback", {
+            peer,
+            account: context.account,
+            method: "LuaCall",
+            command: LUA_COMMAND_CAFE_GENERATE_CUSTOMER,
+            feature: "cafe.customer_queue",
+            customerCount: customerQueue.customerqueue.length,
+          });
+          return;
+        }
+        if (luaCommand === LUA_COMMAND_CAFE_MAKE_COFFEE) {
+          const parameters = call?.parameters as Record<string, unknown> | undefined;
+          const coffeeType = Number(parameters?.coffeetype);
+          const count = Number(parameters?.count);
+          context.player = await players.makeCoffee(context.account, coffeeType, count);
+          send(
+            COMMAND.NTF_S2C_CALL,
+            0,
+            makeServerLuaCall("LuaCall", {
+              sCmd: LUA_COMMAND_CAFE_MAKE_COFFEE,
+              tbParam: makeCoffeeResponse(context.player.cafe.coffees),
+            }),
+          );
+          logger.info("lua.callback", {
+            peer,
+            account: context.account,
+            method: "LuaCall",
+            command: LUA_COMMAND_CAFE_MAKE_COFFEE,
+            feature: "cafe.make_coffee",
+            coffeeType,
+            count,
+          });
+          return;
+        }
+        if (luaCommand === LUA_COMMAND_CAFE_ADD_GUEST_WEIGHT) {
+          send(
+            COMMAND.NTF_S2C_CALL,
+            0,
+            makeServerLuaCall("LuaCall", {
+              sCmd: LUA_COMMAND_CAFE_ADD_GUEST_WEIGHT,
+              tbParam: [],
+            }),
+          );
+          logger.info("lua.callback", {
+            peer,
+            account: context.account,
+            method: "LuaCall",
+            command: LUA_COMMAND_CAFE_ADD_GUEST_WEIGHT,
+            feature: "cafe.guest_weight",
+          });
+          return;
+        }
+        if (luaCommand === LUA_COMMAND_SHOP_GOODS_LIST) {
+          const parameters = call?.parameters as Record<string, unknown> | undefined;
+          const shopId = Number(parameters?.shopid);
+          const response = makeShopGoodsListResponse(shopId);
+          send(
+            COMMAND.NTF_S2C_CALL,
+            0,
+            makeServerLuaCall("LuaCall", {
+              sCmd: LUA_COMMAND_SHOP_GOODS_LIST,
+              tbParam: response,
+            }),
+          );
+          logger.info("lua.callback", {
+            peer,
+            account: context.account,
+            method: "LuaCall",
+            command: LUA_COMMAND_SHOP_GOODS_LIST,
+            feature: "shop.goods_list",
+            shopId,
+            goodsCount: response.goodslist.length,
+          });
+          return;
+        }
+        if (luaCommand === LUA_COMMAND_CAFE_FURNITURE_COUNT) {
+          send(
+            COMMAND.NTF_S2C_CALL,
+            0,
+            makeServerLuaCall("LuaCall", {
+              sCmd: LUA_COMMAND_CAFE_FURNITURE_COUNT,
+              tbParam: { nRet: 0, nNum: 0 },
+            }),
+          );
+          logger.info("lua.callback", {
+            peer,
+            account: context.account,
+            method: "LuaCall",
+            command: LUA_COMMAND_CAFE_FURNITURE_COUNT,
+            feature: "cafe.furniture_count",
+          });
+          return;
+        }
+        if (call?.method === "NCafePetLogic") {
+          const response = makeCafePetResponse(call.parameters);
+          if (response) {
+            send(COMMAND.NTF_S2C_CALL, 0, makeServerLuaCall("NCafePetLogic", response));
+            logger.info("lua.callback", {
+              peer,
+              account: context.account,
+              method: "NCafePetLogic",
+              command: response.sCmd,
+              feature: "cafe.pet",
+            });
+          }
+          return;
+        }
         const formationUpdate = parseFormationUpdateCall(call, context.player);
         if (formationUpdate) {
           context.player = await players.updateFormation(
@@ -393,10 +718,7 @@ export function createGatewayServer({
             const passCount = (previous?.star ?? 0) >>> 3;
             const energyCost = effectiveEnergyCost(level, player.level);
             try {
-              context.player = await players.enterLevel(
-                context.account,
-                energyCost,
-              );
+              context.player = await players.enterLevel(context.account, energyCost);
             } catch (error) {
               if (!(error instanceof InsufficientVigourError)) throw error;
               logger.info("chapter.enter.insufficient_vigour", {
@@ -423,15 +745,9 @@ export function createGatewayServer({
               passCount,
             };
             context.lastSettlement = null;
-            const vigour = context.player.money.find(
-              ({ id }) => id === MONEY_VIGOUR,
-            );
+            const vigour = context.player.money.find(({ id }) => id === MONEY_VIGOUR);
             if (vigour) {
-              send(
-                COMMAND.MONEY_UPDATE_NTF,
-                0,
-                makeMoneyUpdateNotification(vigour),
-              );
+              send(COMMAND.MONEY_UPDATE_NTF, 0, makeMoneyUpdateNotification(vigour));
             }
             send(
               COMMAND.NTF_S2C_CALL,
@@ -487,9 +803,8 @@ export function createGatewayServer({
               const levelId = makeLevelId(chapter, index, difficulty);
               const previous = currentPlayer.levels.find(({ id }) => id === levelId);
               const passCount =
-                context.activeChapter?.passCount ?? ((previous?.star ?? 0) >>> 3);
-              const firstClear =
-                context.activeChapter?.firstClear ?? passCount === 0;
+                context.activeChapter?.passCount ?? (previous?.star ?? 0) >>> 3;
+              const firstClear = context.activeChapter?.firstClear ?? passCount === 0;
               awards = rollChapterAwards(
                 level,
                 firstClear,
@@ -512,11 +827,7 @@ export function createGatewayServer({
                   ({ id }) => id === makeLevelId(chapter, index, difficulty),
                 )?.star ?? star;
               for (const money of settlement.updatedMoney) {
-                send(
-                  COMMAND.MONEY_UPDATE_NTF,
-                  0,
-                  makeMoneyUpdateNotification(money),
-                );
+                send(COMMAND.MONEY_UPDATE_NTF, 0, makeMoneyUpdateNotification(money));
               }
               if (settlement.updatedItems.length > 0) {
                 send(
@@ -537,11 +848,7 @@ export function createGatewayServer({
               },
             };
             context.lastSettlement = { key: settlementKey, response };
-            send(
-              COMMAND.NTF_S2C_CALL,
-              0,
-              makeServerLuaCall("ChapterMsg", response),
-            );
+            send(COMMAND.NTF_S2C_CALL, 0, makeServerLuaCall("ChapterMsg", response));
             logger.info("lua.callback", {
               peer,
               account: context.account,

@@ -30,6 +30,19 @@ export function makeServerLuaCall(method: string, parameters: unknown): Buffer {
   ]);
 }
 
+export function makeHouseInfoResponse(roleId: number): Buffer {
+  const roomIds = [1, 2, 6];
+  const houseCache = Buffer.concat([
+    fieldVarint(1, roleId),
+    ...roomIds.map((roomId) => fieldBytes(4, fieldVarint(1, roomId))),
+  ]);
+  return Buffer.concat([
+    fieldVarint(1, roleId),
+    fieldBytes(2, houseCache),
+    fieldBytes(3, Buffer.alloc(0)),
+  ]);
+}
+
 export function makeVerifyResponse(
   player: Player,
   serverList: AppConfig["serverList"],
@@ -145,10 +158,7 @@ export function makeItemUpdateNotification(
 }
 
 function makeMoneyInfo(money: MoneyState): Buffer {
-  return Buffer.concat([
-    fieldVarint(1, money.id),
-    fieldVarint(2, money.count),
-  ]);
+  return Buffer.concat([fieldVarint(1, money.id), fieldVarint(2, money.count)]);
 }
 
 export function makeMoneyUpdateNotification(money: MoneyState): Buffer {
