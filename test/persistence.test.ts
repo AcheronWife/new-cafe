@@ -44,11 +44,16 @@ it("persists player and task changes atomically", async () => {
     const player = await repository.getOrCreate("tester");
     expect(player.name).toBe("");
     expect(player.lastLoginAt).toBeNull();
+    expect(player.live2dEnableLevel).toBe(3);
+    expect(player.live2dHX).toBe(false);
     expect(player.taskValues).toEqual({
       "131074": 7,
       "264145": 2,
       "274145": 2,
       "278145": 2,
+      "460773": 1,
+      "470773": 1,
+      "474775": 1,
       "1507329": 256,
       "1507330": 256,
       "1507331": 256,
@@ -89,6 +94,31 @@ it("persists player and task changes atomically", async () => {
     expect(clothes.girl).toMatchObject({ girlId: 9, modelId: 1 });
     const fightModelPlayer = await repository.setGirlFightModel("tester", 9, true);
     expect(fightModelPlayer.taskValues["212617"]).toBe(1);
+    const training = await repository.startGirlTraining(
+      "tester",
+      7,
+      21,
+      1_785_260_000_000,
+    );
+    expect(training).toMatchObject({
+      girlId: 7,
+      position: 21,
+      endTime: 1_785_267_200,
+      outdoorId: 72,
+    });
+    expect(training.player.taskValues).toMatchObject({
+      "208611": 0,
+      "208619": 21,
+      "208620": 1_785_267_200,
+      "208624": 72,
+    });
+    const repeatedTraining = await repository.startGirlTraining(
+      "tester",
+      7,
+      21,
+      1_785_270_000_000,
+    );
+    expect(repeatedTraining.endTime).toBe(1_785_267_200);
     await repository.setTaskValues("tester", [{ id: 123, value: 9 }]);
     const cafePlayer = await repository.makeCoffee("tester", 3, 240);
     expect(cafePlayer.cafe).toEqual({
@@ -187,8 +217,10 @@ it("persists player and task changes atomically", async () => {
     ]);
 
     const persisted = JSON.parse(await readFile(filePath, "utf8"));
-    expect(persisted.schemaVersion).toBe(9);
+    expect(persisted.schemaVersion).toBe(10);
     expect(persisted.players.tester.name).toBe("Commander");
+    expect(persisted.players.tester.live2dEnableLevel).toBe(3);
+    expect(persisted.players.tester.live2dHX).toBe(false);
     expect(persisted.players.tester.taskValues["123"]).toBe(9);
     expect(persisted.players.tester.levels).toEqual([{ id: 65_793, star: 23 }]);
     expect(persisted.players.tester.money).toEqual([
@@ -222,6 +254,8 @@ it("persists player and task changes atomically", async () => {
       ({ guid }: { guid: number }) => guid > 10_003,
     );
     delete legacyPlayer.inventory;
+    delete legacyPlayer.live2dEnableLevel;
+    delete legacyPlayer.live2dHX;
     persisted.schemaVersion = 6;
     await writeFile(filePath, `${JSON.stringify(persisted, null, 2)}\n`, "utf8");
 
@@ -252,10 +286,37 @@ it("persists player and task changes atomically", async () => {
       enhanceLevel: 4,
       enhanceExp: 167,
     });
+    expect(migratedPlayer.live2dEnableLevel).toBe(3);
+    expect(migratedPlayer.live2dHX).toBe(false);
     const migratedDocument = JSON.parse(await readFile(filePath, "utf8"));
-    expect(migratedDocument.schemaVersion).toBe(9);
+    expect(migratedDocument.schemaVersion).toBe(10);
     expect(migratedDocument.players.tester).not.toHaveProperty("cards");
     expect(migratedDocument.players.tester).not.toHaveProperty("items");
+
+    const rosterSettlement = await migratedRepository.settleLevel(
+      "tester",
+      1,
+      2,
+      1,
+      3,
+      [
+        [1, 1, 81, 5, 1, 100],
+        [1, 201, 1, 4, 1, 100],
+      ],
+      0,
+    );
+    expect(rosterSettlement.updatedGirls).toMatchObject([
+      { girlId: 1, level: 1, exp: 0, modelId: 8001 },
+      { girlId: 201, level: 1, exp: 0, modelId: 1 },
+    ]);
+    expect(rosterSettlement.player.taskValues).toMatchObject({
+      // Girl 1's 8001 model uses the client's historical 1801 task offset.
+      "263945": 2,
+      "460377": 1,
+      // Linked girls use extension groups 91 (suit) and 92 (card).
+      "5963777": 2,
+      "6029336": 1,
+    });
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

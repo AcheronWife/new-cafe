@@ -45,11 +45,13 @@ import {
   InsufficientVigourError,
   InsufficientGachaCurrencyError,
   EightDaySignUpError,
+  GirlTrainingError,
   isCharacterCard,
   makeGachaTaskId,
   makeLevelId,
   MONEY_VIGOUR,
   type FormationState,
+  type GirlState,
   type Player,
   type PlayerRepository,
 } from "../persistence/player-repository.js";
@@ -61,6 +63,8 @@ import {
   makeFormationUpdateNotification,
   makeGirlUpdateNotification,
   makeHouseInfoResponse,
+  makeLive2DEnableLevelNotification,
+  makeLive2DHXNotification,
   makeMoneyUpdateNotification,
   makePhoneMessageNotification,
   makeServerLuaCall,
@@ -153,6 +157,32 @@ type GirlAppearanceCall =
   | { command: "SetMainGirl"; girlId: number }
   | { command: "ChangeCloth"; girlId: number; modelId: number }
   | { command: "SetModelInFight"; girlId: number; enabled: boolean };
+
+interface GirlTrainingCall {
+  girlId: number;
+  position: number;
+}
+
+function parseGirlTrainingCall(call: LuaCall | null): GirlTrainingCall | null {
+  if (
+    call?.method !== "GirlLogic" ||
+    typeof call.parameters !== "object" ||
+    call.parameters === null
+  ) {
+    return null;
+  }
+
+  const parameters = call.parameters as Record<string, unknown>;
+  if (parameters.sCmd !== "StartTrain") return null;
+  const girlId = Number(parameters.nId);
+  const position = Number(parameters.nPos);
+  return Number.isSafeInteger(girlId) &&
+    girlId > 0 &&
+    Number.isSafeInteger(position) &&
+    position > 0
+    ? { girlId, position }
+    : null;
+}
 
 function parseGirlAppearanceCall(call: LuaCall | null): GirlAppearanceCall | null {
   if (
@@ -331,6 +361,11 @@ export function createGatewayServer({
       });
     }
 
+    function sendGirlUpdates(girls: readonly GirlState[]): void {
+      if (girls.length === 0) return;
+      send(COMMAND.GIRL_UPDATE_NTF, 0, makeGirlUpdateNotification(girls));
+    }
+
     async function handlePacket(packetBuffer: Buffer): Promise<void> {
       const packet = readPacket(packetBuffer);
       const preview = hexPreview(packet.payload, config.logging.maxPayloadHexBytes);
@@ -383,6 +418,17 @@ export function createGatewayServer({
         });
 
         send(COMMAND.TASK_VALUE_RSP, 0, makeTaskValueSync(context.player.taskValues));
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        send(
+          COMMAND.LIVE2D_ENABLE_LEVEL_NTF,
+          0,
+          makeLive2DEnableLevelNotification(context.player.live2dEnableLevel),
+        );
+        send(
+          COMMAND.LIVE2D_HX_STATE_NTF,
+          0,
+          makeLive2DHXNotification(context.player.live2dHX),
+        );
         await new Promise((resolve) => setTimeout(resolve, 20));
         send(COMMAND.PLAYER_NTF, 0, makePlayerNotification(context.player));
         await new Promise((resolve) => setTimeout(resolve, 20));
@@ -456,6 +502,7 @@ export function createGatewayServer({
       if (packet.command === COMMAND.C2S_CALL_REQ) {
         const call = parseLuaCall(packet.payload);
         const luaCommand = parseNumericLuaCommand(call);
+        const girlTrainingCall = parseGirlTrainingCall(call);
         const girlAppearanceCall = parseGirlAppearanceCall(call);
         logger.info("lua.call", {
           peer,
@@ -499,6 +546,7 @@ export function createGatewayServer({
               makeItemUpdateNotification(result.updatedItems),
             );
           }
+          sendGirlUpdates(result.updatedGirls);
           for (const money of result.updatedMoney) {
             send(COMMAND.MONEY_UPDATE_NTF, 0, makeMoneyUpdateNotification(money));
           }
@@ -550,6 +598,7 @@ export function createGatewayServer({
                   makeItemUpdateNotification(result.updatedItems),
                 );
               }
+              sendGirlUpdates(result.updatedGirls);
               for (const money of result.updatedMoney) {
                 send(COMMAND.MONEY_UPDATE_NTF, 0, makeMoneyUpdateNotification(money));
               }
@@ -682,6 +731,7 @@ export function createGatewayServer({
                 makeItemUpdateNotification(result.updatedItems),
               );
             }
+            sendGirlUpdates(result.updatedGirls);
             for (const money of result.updatedMoney) {
               send(COMMAND.MONEY_UPDATE_NTF, 0, makeMoneyUpdateNotification(money));
             }
@@ -860,6 +910,7 @@ export function createGatewayServer({
                   makeItemUpdateNotification(result.updatedItems),
                 );
               }
+              sendGirlUpdates(result.updatedGirls);
               for (const money of result.updatedMoney) {
                 send(COMMAND.MONEY_UPDATE_NTF, 0, makeMoneyUpdateNotification(money));
               }
@@ -1012,6 +1063,7 @@ export function createGatewayServer({
                 makeItemUpdateNotification(result.updatedItems),
               );
             }
+            sendGirlUpdates(result.updatedGirls);
             for (const money of result.updatedMoney) {
               send(COMMAND.MONEY_UPDATE_NTF, 0, makeMoneyUpdateNotification(money));
             }
@@ -1693,6 +1745,12 @@ export function createGatewayServer({
                   makeItemUpdateNotification(settlement.updatedItems),
                 );
               }
+              sendGirlUpdates(settlement.updatedGirls);
+              send(
+                COMMAND.TASK_VALUE_RSP,
+                0,
+                makeTaskValueSync(settlement.player.taskValues),
+              );
               if (
                 settlement.experienceUpdate.addedExperience > 0 ||
                 settlement.experienceUpdate.levelsGained > 0
@@ -1731,6 +1789,54 @@ export function createGatewayServer({
               playerLevel: context.player?.level,
               playerExp: context.player?.exp,
             });
+          } else if (girlTrainingCall) {
+            try {
+              const result = await players.startGirlTraining(
+                context.account,
+                girlTrainingCall.girlId,
+                girlTrainingCall.position,
+              );
+              context.player = result.player;
+              send(
+                COMMAND.TASK_VALUE_RSP,
+                0,
+                makeTaskValueSync(result.player.taskValues),
+              );
+              send(
+                COMMAND.NTF_S2C_CALL,
+                0,
+                makeServerLuaCall("GirlLogic", {
+                  sCmd: "StartTrain",
+                  nId: result.girlId,
+                  nPos: result.position,
+                }),
+              );
+              logger.info("girl.training.started", {
+                peer,
+                account: context.account,
+                girlId: result.girlId,
+                position: result.position,
+                endTime: result.endTime,
+                outdoorId: result.outdoorId,
+              });
+            } catch (error) {
+              if (!(error instanceof GirlTrainingError)) throw error;
+              send(
+                COMMAND.NTF_S2C_CALL,
+                0,
+                makeServerLuaCall("GirlLogic", {
+                  sCmd: "StartTrain",
+                  nError: error.clientError,
+                }),
+              );
+              logger.warn("girl.training.rejected", {
+                peer,
+                account: context.account,
+                ...girlTrainingCall,
+                reason: error.reason,
+                clientError: error.clientError,
+              });
+            }
           } else if (girlAppearanceCall) {
             let callback: Record<string, unknown>;
             if (girlAppearanceCall.command === "SetMainGirl") {

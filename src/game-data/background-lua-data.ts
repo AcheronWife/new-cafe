@@ -4,6 +4,7 @@ export const LUA_COMMAND_RANDOM_EVENT = 170;
 export const LUA_COMMAND_GIRL_TEST_OPEN_PERIOD = 202;
 export const LUA_COMMAND_PROMISE_IS_OPEN = 230;
 export const LUA_COMMAND_PROMISE_GIRLS = 231;
+export const LUA_COMMAND_ASSIST_LIST = 250;
 export const LUA_COMMAND_CLUB_INFO = 10_002;
 
 const BACKGROUND_COMMANDS = new Set([
@@ -13,6 +14,7 @@ const BACKGROUND_COMMANDS = new Set([
   LUA_COMMAND_GIRL_TEST_OPEN_PERIOD,
   LUA_COMMAND_PROMISE_IS_OPEN,
   LUA_COMMAND_PROMISE_GIRLS,
+  LUA_COMMAND_ASSIST_LIST,
   LUA_COMMAND_CLUB_INFO,
 ]);
 
@@ -62,6 +64,10 @@ export function makeBackgroundLuaResponse(
     case LUA_COMMAND_PROMISE_IS_OPEN:
       return { PromiseIsOpen: false };
     case LUA_COMMAND_PROMISE_GIRLS:
+      return [];
+    case LUA_COMMAND_ASSIST_LIST:
+      // UI_Support explicitly supports an empty result: it shows its
+      // no-player state and still lets the pending sortie callback continue.
       return [];
     case LUA_COMMAND_CLUB_INFO:
       // ClubCommon treats a response without `primary` as "not in a club".

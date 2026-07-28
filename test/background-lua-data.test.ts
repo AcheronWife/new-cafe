@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  LUA_COMMAND_ASSIST_LIST,
   LUA_COMMAND_CLUB_INFO,
   LUA_COMMAND_FRIEND_LIST,
   LUA_COMMAND_PROMISE_GIRLS,
@@ -28,6 +29,12 @@ describe("background Lua empty-state responses", () => {
   it("returns safe empty values for optional systems", () => {
     expect(makeBackgroundLuaResponse(LUA_COMMAND_RANDOM_EVENT, {})).toEqual({});
     expect(makeBackgroundLuaResponse(LUA_COMMAND_PROMISE_GIRLS, {})).toEqual([]);
+    expect(
+      makeBackgroundLuaResponse(LUA_COMMAND_ASSIST_LIST, {
+        Power: 3530,
+        ChapterType: [],
+      }),
+    ).toEqual([]);
     expect(makeBackgroundLuaResponse(LUA_COMMAND_CLUB_INFO, {})).toEqual({});
   });
 

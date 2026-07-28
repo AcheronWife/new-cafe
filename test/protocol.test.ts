@@ -6,6 +6,8 @@ import {
   makeFormationUpdateNotification,
   makeGirlUpdateNotification,
   makeHouseInfoResponse,
+  makeLive2DEnableLevelNotification,
+  makeLive2DHXNotification,
   makeMoneyUpdateNotification,
   makePhoneMessageNotification,
   makePlayerNotification,
@@ -30,6 +32,8 @@ describe("game protocol", () => {
     serverZone: 8,
     registerTime: 1,
     lastLoginAt: null,
+    live2dEnableLevel: 3,
+    live2dHX: false,
     taskValues: {},
     nextItemGuid: 20_001,
     money: [
@@ -158,6 +162,12 @@ describe("game protocol", () => {
     ).toEqual([4, 4]);
   });
 
+  it("encodes global Live2D EnableLevel and HX notifications", () => {
+    expect(firstNumber(decodeFields(makeLive2DEnableLevelNotification(3)), 1)).toBe(3);
+    expect(firstNumber(decodeFields(makeLive2DHXNotification(true)), 1)).toBe(1);
+    expect(firstNumber(decodeFields(makeLive2DHXNotification(false)), 1)).toBe(0);
+  });
+
   it("encodes the initial cafe, rest and dorm rooms", () => {
     expect(makeHouseInfoResponse(7).toString("hex")).toBe(
       "0807120e08072202080122020802220208061a00",
@@ -192,6 +202,8 @@ describe("game protocol", () => {
         serverZone: 8,
         registerTime: 1,
         lastLoginAt: null,
+        live2dEnableLevel: 3,
+        live2dHX: false,
         taskValues: {},
         inventory: [],
         nextItemGuid: 20_001,
@@ -225,6 +237,8 @@ describe("game protocol", () => {
         serverZone: 8,
         registerTime: 1,
         lastLoginAt: "2026-07-28T00:00:00.000Z",
+        live2dEnableLevel: 3,
+        live2dHX: false,
         taskValues: {},
         inventory: [],
         nextItemGuid: 20_001,

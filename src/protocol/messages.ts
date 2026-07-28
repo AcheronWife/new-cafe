@@ -94,6 +94,14 @@ export function makePlayerUpdateNotification(player: Player): Buffer {
   ]);
 }
 
+export function makeLive2DEnableLevelNotification(level: number): Buffer {
+  return fieldVarint(1, level);
+}
+
+export function makeLive2DHXNotification(active: boolean): Buffer {
+  return fieldVarint(1, active ? 1 : 0);
+}
+
 /**
  * Encodes the login-time PhoneMsgNtf consumed by Game.PhoneMsgMgr.
  */
@@ -140,8 +148,11 @@ function makeGirlInfo(girl: GirlState): Buffer {
   ]);
 }
 
-export function makeGirlUpdateNotification(girl: GirlState): Buffer {
-  return fieldBytes(1, makeGirlInfo(girl));
+export function makeGirlUpdateNotification(
+  girls: GirlState | readonly GirlState[],
+): Buffer {
+  const updates = Array.isArray(girls) ? girls : [girls];
+  return Buffer.concat(updates.map((girl) => fieldBytes(1, makeGirlInfo(girl))));
 }
 
 function makeGirlList(girls: readonly GirlState[]): Buffer {

@@ -5,6 +5,10 @@ import {
   type CardEnhancementMaterial,
 } from "../game-data/card-enhancement-data.js";
 import {
+  characterCardModelId,
+  isPlayableGirlId,
+} from "../game-data/character-card-data.js";
+import {
   addWeaponExperience,
   sacrificedWeaponValue,
   weaponExperienceMaterial,
@@ -35,6 +39,11 @@ import type {
   Gdpl,
   Gdpln,
 } from "../game-data/gacha-data.js";
+import {
+  DEFAULT_TRAINING_OUTDOOR_ID,
+  getGirlTrainingConfig,
+  MAX_CONCURRENT_GIRL_TRAINING,
+} from "../game-data/girl-training-data.js";
 import { addPlayerExperience } from "../game-data/player-level-data.js";
 import type { Logger } from "../logger.js";
 import type { JsonStore } from "./json-store.js";
@@ -49,8 +58,16 @@ export const MAIN_GIRL_TASK_ID = (2 << 16) | 2;
 
 const GIRL_STATE_TASK_GROUP = 3;
 const GIRL_SUIT_TASK_GROUP = 4;
+const GIRL_CARD_TASK_GROUP = 7;
 const GIRL_TASK_STRIDE = 2_000;
+const GIRL_CAFE_POSITION_OFFSET = 3;
 const GIRL_FIGHT_MODEL_OFFSET = 9;
+const GIRL_TRAIN_POSITION_OFFSET = 11;
+const GIRL_TRAIN_END_TIME_OFFSET = 12;
+const GIRL_TRAIN_OUTDOOR_ID_OFFSET = 16;
+const LINK_GIRL_ID = 200;
+const LINK_GIRL_MIN_ID = 201;
+const LINK_GIRL_MAX_ID = 204;
 
 export function makeGachaTaskId(taskId: number): number {
   return (GACHA_TASK_GROUP << 16) | taskId;
@@ -170,6 +187,8 @@ export interface Player {
   serverZone: number;
   registerTime: number;
   lastLoginAt: string | null;
+  live2dEnableLevel: number;
+  live2dHX: boolean;
   taskValues: Record<string, number>;
   inventory: InventoryEntryState[];
   nextItemGuid: number;
@@ -185,7 +204,7 @@ export interface Player {
 }
 
 export interface PersistedState {
-  schemaVersion: 9;
+  schemaVersion: 10;
   nextRoleId: number;
   players: Record<string, Player>;
   updatedAt: string | null;
@@ -200,6 +219,7 @@ export interface ChapterSettlement {
   player: Player;
   updatedItems: InventoryItemState[];
   updatedMoney: MoneyState[];
+  updatedGirls: GirlState[];
   experienceUpdate: PlayerExperienceUpdate;
 }
 
@@ -216,6 +236,29 @@ export interface PlayerExperienceUpdate {
 export interface GirlAppearanceResult {
   player: Player;
   girl: GirlState;
+}
+
+export interface GirlTrainingResult {
+  player: Player;
+  girlId: number;
+  position: number;
+  endTime: number;
+  outdoorId: number;
+}
+
+export class GirlTrainingError extends Error {
+  constructor(
+    readonly reason:
+      | "girl_not_owned"
+      | "invalid_position"
+      | "girl_already_training"
+      | "position_occupied"
+      | "training_limit",
+    readonly clientError: 5 | 6 = 5,
+  ) {
+    super(`Girl training error: ${reason}`);
+    this.name = "GirlTrainingError";
+  }
 }
 
 export interface CardEnhancementResult {
@@ -241,6 +284,7 @@ export interface GachaCommitResult {
   awards: GachaAward[];
   updatedItems: InventoryItemState[];
   updatedMoney: MoneyState[];
+  updatedGirls: GirlState[];
   getItem: Gdpln | null;
 }
 
@@ -251,6 +295,7 @@ export interface DailySignUpResult {
   cumulativeCount: number;
   updatedItems: InventoryItemState[];
   updatedMoney: MoneyState[];
+  updatedGirls: GirlState[];
 }
 
 export interface EightDaySignUpAwardResult {
@@ -259,6 +304,7 @@ export interface EightDaySignUpAwardResult {
   awards: readonly BaseAward[];
   updatedItems: InventoryItemState[];
   updatedMoney: MoneyState[];
+  updatedGirls: GirlState[];
 }
 
 export class InsufficientVigourError extends Error {
@@ -319,31 +365,162 @@ function makeInitialGachaState(): GachaState {
   return { pending: null };
 }
 
-function makeGirlTaskId(group: number, girlId: number, offset: number): number {
-  return (group << 16) | ((girlId - 1) * GIRL_TASK_STRIDE + offset);
+function reconcileLive2DState(player: Player): void {
+  if (!Number.isSafeInteger(player.live2dEnableLevel) || player.live2dEnableLevel < 0) {
+    player.live2dEnableLevel = 3;
+  }
+  if (typeof player.live2dHX !== "boolean") {
+    player.live2dHX = false;
+  }
 }
 
-function reconcileGirlAppearanceState(player: Player): void {
+function makeGirlTaskId(group: number, girlId: number, offset: number): number {
+  let taskGroup = group;
+  let taskGirlId = girlId;
+  if (girlId >= LINK_GIRL_MIN_ID && girlId <= LINK_GIRL_MAX_ID) {
+    taskGroup =
+      group === GIRL_STATE_TASK_GROUP
+        ? 90
+        : group === GIRL_SUIT_TASK_GROUP
+          ? 91
+          : group === GIRL_CARD_TASK_GROUP
+            ? 92
+            : group;
+    taskGirlId -= LINK_GIRL_ID;
+  }
+  return (taskGroup << 16) | ((taskGirlId - 1) * GIRL_TASK_STRIDE + offset);
+}
+
+function fixGirlModelTaskOffset(modelId: number): number {
+  if (!Number.isSafeInteger(modelId) || modelId <= 0) {
+    throw new Error(`Invalid girl model id: ${modelId}`);
+  }
+  if (modelId < 2_000) return modelId;
+  if (modelId >= 8_001 && modelId <= 8_003) return modelId - 6_200;
+  if (modelId >= 3_000) {
+    const suffix = modelId % 100;
+    if (suffix <= 29) {
+      return suffix + Math.floor(modelId / 1_000) * 30 + 1_500;
+    }
+  }
+  throw new Error(`Invalid girl model id: ${modelId}`);
+}
+
+interface GirlRosterReconciliation {
+  updatedGirlIds: Set<number>;
+  tasksChanged: boolean;
+}
+
+function reconcileGirlAppearanceState(
+  player: Player,
+  newlyAwardedItemGuids: ReadonlySet<number> = new Set<number>(),
+): GirlRosterReconciliation {
+  const updatedGirlIds = new Set<number>();
+  let tasksChanged = false;
+  const setTaskValue = (taskId: number, value: number): void => {
+    const key = String(taskId);
+    if (player.taskValues[key] === value) return;
+    player.taskValues[key] = value;
+    tasksChanged = true;
+  };
+
+  const ownedModelsByGirl = new Map<number, number[]>();
+  const ownedCardCounts = new Map<number, number>();
+  for (const card of player.inventory.filter(isCharacterCard)) {
+    if (!isPlayableGirlId(card.detail)) continue;
+    const modelId = characterCardModelId(card);
+    if (modelId === null) continue;
+
+    let ownedModels = ownedModelsByGirl.get(card.detail);
+    if (!ownedModels) {
+      ownedModels = [];
+      ownedModelsByGirl.set(card.detail, ownedModels);
+    }
+    if (!ownedModels.includes(modelId)) ownedModels.push(modelId);
+
+    const cardTaskId = makeGirlTaskId(
+      GIRL_CARD_TASK_GROUP,
+      card.detail,
+      card.particular * 20 + card.templateLevel,
+    );
+    ownedCardCounts.set(
+      cardTaskId,
+      (ownedCardCounts.get(cardTaskId) ?? 0) + Math.max(1, card.count),
+    );
+
+    const suitTaskId = makeGirlTaskId(
+      GIRL_SUIT_TASK_GROUP,
+      card.detail,
+      fixGirlModelTaskOffset(modelId),
+    );
+    const suitTaskKey = String(suitTaskId);
+    if ((player.taskValues[suitTaskKey] ?? 0) <= 0) {
+      setTaskValue(suitTaskId, newlyAwardedItemGuids.has(card.guid) ? 1 : 2);
+    }
+  }
+
+  for (const [cardTaskId, count] of ownedCardCounts) {
+    setTaskValue(cardTaskId, count);
+  }
+
+  for (const [girlId, ownedModels] of ownedModelsByGirl) {
+    let girl = player.girls.find((candidate) => candidate.girlId === girlId);
+    if (!girl) {
+      girl = {
+        girlId,
+        level: 1,
+        exp: 0,
+        modelId: ownedModels[0] ?? 1,
+        moodValue: 100,
+        vigor: 100,
+        flag: 0,
+      };
+      player.girls.push(girl);
+      updatedGirlIds.add(girlId);
+    } else if (!ownedModels.includes(girl.modelId)) {
+      girl.modelId = ownedModels[0] ?? 1;
+      updatedGirlIds.add(girlId);
+    }
+
+    // The currently worn suit is no longer "new".
+    setTaskValue(
+      makeGirlTaskId(
+        GIRL_SUIT_TASK_GROUP,
+        girlId,
+        fixGirlModelTaskOffset(girl.modelId),
+      ),
+      2,
+    );
+  }
+
+  // Retain legacy girl states that do not have a corresponding card, but make
+  // sure their currently selected model remains usable.
+  for (const girl of player.girls) {
+    if (ownedModelsByGirl.has(girl.girlId)) continue;
+    const modelId = Math.max(1, girl.modelId);
+    if (girl.modelId !== modelId) {
+      girl.modelId = modelId;
+      updatedGirlIds.add(girl.girlId);
+    }
+    setTaskValue(
+      makeGirlTaskId(
+        GIRL_SUIT_TASK_GROUP,
+        girl.girlId,
+        fixGirlModelTaskOffset(modelId),
+      ),
+      2,
+    );
+  }
+
   const mainGirlId = player.taskValues[String(MAIN_GIRL_TASK_ID)] ?? 0;
   if (!player.girls.some(({ girlId }) => girlId === mainGirlId)) {
     const fallback = player.girls[0]?.girlId;
     if (fallback !== undefined) {
-      player.taskValues[String(MAIN_GIRL_TASK_ID)] = fallback;
+      setTaskValue(MAIN_GIRL_TASK_ID, fallback);
     }
   }
 
-  for (const girl of player.girls) {
-    // Obtaining a girl always unlocks her base suit. Preserve an existing
-    // "new" marker (1), otherwise store the client's worn marker (2).
-    const baseSuitTaskId = String(makeGirlTaskId(GIRL_SUIT_TASK_GROUP, girl.girlId, 1));
-    player.taskValues[baseSuitTaskId] ||= 2;
-
-    const currentModelId = Math.max(1, girl.modelId);
-    const currentSuitTaskId = String(
-      makeGirlTaskId(GIRL_SUIT_TASK_GROUP, girl.girlId, currentModelId),
-    );
-    player.taskValues[currentSuitTaskId] ||= 2;
-  }
+  return { updatedGirlIds, tasksChanged };
 }
 
 function applyPlayerExperience(
@@ -779,6 +956,7 @@ export class PlayerRepository {
         player.cafe ??= makeInitialCafeState();
         player.phone ??= migratePhoneState(player);
         player.gacha ??= makeInitialGachaState();
+        reconcileLive2DState(player);
         const experienceUpdate = applyPlayerExperience(player, 0);
         if (experienceUpdate.levelsGained > 0) {
           this.#logger.info("player.experience.reconciled", {
@@ -790,7 +968,7 @@ export class PlayerRepository {
         reconcileGirlAppearanceState(player);
         reconcileDailySignUp(player);
         reconcileEightDaySignUp(player);
-        state.schemaVersion = 9;
+        state.schemaVersion = 10;
         return;
       }
 
@@ -806,6 +984,8 @@ export class PlayerRepository {
         serverZone: this.#defaults.serverZone,
         registerTime,
         lastLoginAt: null,
+        live2dEnableLevel: 3,
+        live2dHX: false,
         taskValues: {
           ...INITIAL_COFFEE_TASK_VALUES,
           ...(this.#defaults.firstLevelComplete ? { [FIRST_LEVEL_TASK_ID]: 6 } : {}),
@@ -825,7 +1005,7 @@ export class PlayerRepository {
       };
       reconcileEightDaySignUp(player);
       reconcileGirlAppearanceState(player);
-      state.schemaVersion = 9;
+      state.schemaVersion = 10;
       state.players[safeAccount] = player;
       this.#logger.info("player.created", { account: safeAccount, roleId });
     });
@@ -891,7 +1071,9 @@ export class PlayerRepository {
       if (!player) throw new Error(`Unknown player account: ${account}`);
       girl = player.girls.find((candidate) => candidate.girlId === girlId);
       if (!girl) throw new Error(`Player does not own girl ${girlId}`);
-      const suitTaskId = String(makeGirlTaskId(GIRL_SUIT_TASK_GROUP, girlId, modelId));
+      const suitTaskId = String(
+        makeGirlTaskId(GIRL_SUIT_TASK_GROUP, girlId, fixGirlModelTaskOffset(modelId)),
+      );
       if ((player.taskValues[suitTaskId] ?? 0) <= 0) {
         throw new Error(`Player does not own girl ${girlId} model ${modelId}`);
       }
@@ -931,6 +1113,95 @@ export class PlayerRepository {
     return structuredClone(player);
   }
 
+  async startGirlTraining(
+    account: string,
+    girlId: number,
+    position: number,
+    now = Date.now(),
+  ): Promise<GirlTrainingResult> {
+    const config = getGirlTrainingConfig(position);
+    if (!config) throw new GirlTrainingError("invalid_position");
+
+    let player: Player | undefined;
+    let endTime = 0;
+    let idempotent = false;
+    await this.#store.update((state) => {
+      player = state.players[account];
+      if (!player) throw new Error(`Unknown player account: ${account}`);
+      if (!player.girls.some((girl) => girl.girlId === girlId)) {
+        throw new GirlTrainingError("girl_not_owned");
+      }
+
+      const trainPositionKey = String(
+        makeGirlTaskId(GIRL_STATE_TASK_GROUP, girlId, GIRL_TRAIN_POSITION_OFFSET),
+      );
+      const trainEndTimeKey = String(
+        makeGirlTaskId(GIRL_STATE_TASK_GROUP, girlId, GIRL_TRAIN_END_TIME_OFFSET),
+      );
+      const currentPosition = player.taskValues[trainPositionKey] ?? 0;
+      if (currentPosition === position) {
+        endTime = player.taskValues[trainEndTimeKey] ?? 0;
+        idempotent = true;
+        return;
+      }
+      if (currentPosition > 0) {
+        throw new GirlTrainingError("girl_already_training");
+      }
+
+      let activeTrainingCount = 0;
+      for (const girl of player.girls) {
+        const candidatePosition =
+          player.taskValues[
+            String(
+              makeGirlTaskId(
+                GIRL_STATE_TASK_GROUP,
+                girl.girlId,
+                GIRL_TRAIN_POSITION_OFFSET,
+              ),
+            )
+          ] ?? 0;
+        if (candidatePosition === position) {
+          throw new GirlTrainingError("position_occupied");
+        }
+        if (candidatePosition > 0) activeTrainingCount += 1;
+      }
+      if (activeTrainingCount >= MAX_CONCURRENT_GIRL_TRAINING) {
+        throw new GirlTrainingError("training_limit", 6);
+      }
+
+      endTime = Math.floor(now / 1_000) + config.durationSeconds;
+      player.taskValues[
+        String(makeGirlTaskId(GIRL_STATE_TASK_GROUP, girlId, GIRL_CAFE_POSITION_OFFSET))
+      ] = 0;
+      player.taskValues[trainPositionKey] = position;
+      player.taskValues[trainEndTimeKey] = endTime;
+      player.taskValues[
+        String(
+          makeGirlTaskId(GIRL_STATE_TASK_GROUP, girlId, GIRL_TRAIN_OUTDOOR_ID_OFFSET),
+        )
+      ] = DEFAULT_TRAINING_OUTDOOR_ID;
+    });
+    if (!player) throw new Error(`Failed to start girl training: ${account}`);
+    this.#logger.info("player.girl_training.started", {
+      account,
+      girlId,
+      position,
+      trainingType: config.type,
+      endTime,
+      durationSeconds: config.durationSeconds,
+      loveReward: config.loveReward,
+      crystalReward: config.crystalReward,
+      idempotent,
+    });
+    return {
+      player: structuredClone(player),
+      girlId,
+      position,
+      endTime,
+      outdoorId: DEFAULT_TRAINING_OUTDOOR_ID,
+    };
+  }
+
   async setTaskValues(
     account: string,
     changes: readonly TaskChange[],
@@ -955,6 +1226,7 @@ export class PlayerRepository {
     let cumulativeCount = 0;
     const updatedItemGuids = new Set<number>();
     const updatedMoneyIds = new Set<number>();
+    const updatedGirlIds = new Set<number>();
     await this.#store.update((state) => {
       player = state.players[account];
       if (!player) throw new Error(`Unknown player account: ${account}`);
@@ -1004,8 +1276,12 @@ export class PlayerRepository {
         cycle: operationalDate.slice(0, 7),
         lastOperationalDate: operationalDate,
       };
+      const girlReconciliation = reconcileGirlAppearanceState(player, updatedItemGuids);
+      for (const girlId of girlReconciliation.updatedGirlIds) {
+        updatedGirlIds.add(girlId);
+      }
       fresh = true;
-      state.schemaVersion = 9;
+      state.schemaVersion = 10;
     });
     if (!player) throw new Error(`Failed to sign in player: ${account}`);
     const snapshot = structuredClone(player);
@@ -1023,6 +1299,7 @@ export class PlayerRepository {
       cumulativeCount,
       updatedItems: snapshot.inventory.filter(({ guid }) => updatedItemGuids.has(guid)),
       updatedMoney: snapshot.money.filter(({ id }) => updatedMoneyIds.has(id)),
+      updatedGirls: snapshot.girls.filter(({ girlId }) => updatedGirlIds.has(girlId)),
     };
   }
 
@@ -1036,6 +1313,7 @@ export class PlayerRepository {
     let player: Player | undefined;
     const updatedItemGuids = new Set<number>();
     const updatedMoneyIds = new Set<number>();
+    const updatedGirlIds = new Set<number>();
     await this.#store.update((state) => {
       player = state.players[account];
       if (!player) throw new Error(`Unknown player account: ${account}`);
@@ -1055,7 +1333,11 @@ export class PlayerRepository {
         true,
       );
       grantAwards(player, reward.awards, updatedItemGuids, updatedMoneyIds);
-      state.schemaVersion = 9;
+      const girlReconciliation = reconcileGirlAppearanceState(player, updatedItemGuids);
+      for (const girlId of girlReconciliation.updatedGirlIds) {
+        updatedGirlIds.add(girlId);
+      }
+      state.schemaVersion = 10;
     });
     if (!player) {
       throw new Error(`Failed to claim eight-day sign-up award: ${account}`);
@@ -1072,6 +1354,7 @@ export class PlayerRepository {
       awards: reward.awards,
       updatedItems: snapshot.inventory.filter(({ guid }) => updatedItemGuids.has(guid)),
       updatedMoney: snapshot.money.filter(({ id }) => updatedMoneyIds.has(id)),
+      updatedGirls: snapshot.girls.filter(({ girlId }) => updatedGirlIds.has(girlId)),
     };
   }
 
@@ -1094,7 +1377,7 @@ export class PlayerRepository {
         upPity: roll.counters.upPity,
         total: roll.counters.total,
       };
-      state.schemaVersion = 9;
+      state.schemaVersion = 10;
     });
     if (!player) throw new Error(`Failed to save pending gacha: ${account}`);
     return structuredClone(player);
@@ -1111,6 +1394,7 @@ export class PlayerRepository {
     let player: Player | undefined;
     const updatedItemGuids = new Set<number>();
     const updatedMoneyIds = new Set<number>();
+    const updatedGirlIds = new Set<number>();
     let getItem: Gdpln | null = null;
     await this.#store.update((state) => {
       player = state.players[account];
@@ -1161,8 +1445,12 @@ export class PlayerRepository {
       if (wonUpBox && pool.upBox) {
         addInventoryAward(player, pool.upBox, updatedItemGuids);
       }
+      const girlReconciliation = reconcileGirlAppearanceState(player, updatedItemGuids);
+      for (const girlId of girlReconciliation.updatedGirlIds) {
+        updatedGirlIds.add(girlId);
+      }
       if (fromPending) player.gacha.pending = null;
-      state.schemaVersion = 9;
+      state.schemaVersion = 10;
     });
     if (!player) throw new Error(`Failed to perform gacha: ${account}`);
     const snapshot = structuredClone(player);
@@ -1184,6 +1472,7 @@ export class PlayerRepository {
       awards: structuredClone(roll.awards),
       updatedItems: snapshot.inventory.filter(({ guid }) => updatedItemGuids.has(guid)),
       updatedMoney: snapshot.money.filter(({ id }) => updatedMoneyIds.has(id)),
+      updatedGirls: snapshot.girls.filter(({ girlId }) => updatedGirlIds.has(girlId)),
       getItem,
     };
   }
@@ -1251,7 +1540,7 @@ export class PlayerRepository {
       } else {
         player.cafe.coffees.push({ coffeetype: coffeeType, count });
       }
-      state.schemaVersion = 9;
+      state.schemaVersion = 10;
     });
     this.#logger.info("player.cafe.coffee_made", {
       account,
@@ -1551,7 +1840,7 @@ export class PlayerRepository {
       if (letter && !letter.replyIds.includes(replyId)) {
         letter.replyIds.push(replyId);
       }
-      state.schemaVersion = 9;
+      state.schemaVersion = 10;
     });
     if (!player) throw new Error(`Failed to reply to phone letter: ${account}`);
     return structuredClone(player);
@@ -1566,7 +1855,7 @@ export class PlayerRepository {
       player.phone.letters = player.phone.letters.filter(
         (letter) => letter.topicId !== topicId,
       );
-      state.schemaVersion = 9;
+      state.schemaVersion = 10;
     });
     if (!player) throw new Error(`Failed to remove phone letter: ${account}`);
     return structuredClone(player);
@@ -1590,7 +1879,7 @@ export class PlayerRepository {
           replyIds: [],
         });
       }
-      state.schemaVersion = 9;
+      state.schemaVersion = 10;
     });
     if (!player) throw new Error(`Failed to add phone letter: ${account}`);
     return structuredClone(player);
@@ -1644,6 +1933,7 @@ export class PlayerRepository {
     let experienceUpdate: PlayerExperienceUpdate | undefined;
     const updatedItemGuids = new Set<number>();
     const updatedMoneyIds = new Set<number>();
+    const updatedGirlIds = new Set<number>();
     await this.#store.update((state) => {
       player = state.players[account];
       if (!player) throw new Error(`Unknown player account: ${account}`);
@@ -1669,7 +1959,7 @@ export class PlayerRepository {
           replyIds: [],
         });
       }
-      state.schemaVersion = 9;
+      state.schemaVersion = 10;
       experienceUpdate = applyPlayerExperience(player, masterExp);
       if (experienceUpdate.vigourRecovery > 0) {
         updatedMoneyIds.add(MONEY_VIGOUR);
@@ -1741,6 +2031,10 @@ export class PlayerRepository {
           updatedItemGuids.add(item.guid);
         }
       }
+      const girlReconciliation = reconcileGirlAppearanceState(player, updatedItemGuids);
+      for (const girlId of girlReconciliation.updatedGirlIds) {
+        updatedGirlIds.add(girlId);
+      }
     });
     if (!player) throw new Error(`Failed to settle level: ${account}`);
     if (!experienceUpdate) throw new Error(`Failed to update experience: ${account}`);
@@ -1758,6 +2052,7 @@ export class PlayerRepository {
       player: snapshot,
       updatedItems: snapshot.inventory.filter(({ guid }) => updatedItemGuids.has(guid)),
       updatedMoney: snapshot.money.filter(({ id }) => updatedMoneyIds.has(id)),
+      updatedGirls: snapshot.girls.filter(({ girlId }) => updatedGirlIds.has(girlId)),
       experienceUpdate,
     };
   }
@@ -1807,7 +2102,7 @@ export class PlayerRepository {
 
 export function makeInitialState(): PersistedState {
   return {
-    schemaVersion: 9,
+    schemaVersion: 10,
     nextRoleId: 1,
     players: {},
     updatedAt: null,
