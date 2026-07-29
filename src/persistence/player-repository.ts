@@ -1,10 +1,23 @@
 import type { AppConfig } from "../config.js";
 import { createDefaultActivityEngine } from "../activities/default-activity-engine.js";
+import type { DomainEvent } from "../activities/domain-events.js";
 import {
   addCardExperience,
   CARD_EXP_MATERIALS,
   type CardEnhancementMaterial,
 } from "../game-data/card-enhancement-data.js";
+import {
+  BOUNTY_DAILY_REWARD_COUNT,
+  bountyOperationalDate,
+  makeBountyDailyTaskId,
+  makeBountyPassTaskId,
+  type BountyEventType,
+  type BountyLevelConfig,
+} from "../game-data/bounty-data.js";
+import {
+  characterCardDecompositionReward,
+  MAX_CARD_DECOMPOSITION_COUNT,
+} from "../game-data/card-decomposition-data.js";
 import {
   characterCardModelId,
   isPlayableGirlId,
@@ -16,8 +29,22 @@ import {
   weaponMaximumLevel,
   type WeaponEnhancementMaterial,
 } from "../game-data/weapon-enhancement-data.js";
+import {
+  MAX_WEAPON_DECOMPOSITION_COUNT,
+  weaponDecompositionReward,
+} from "../game-data/weapon-decomposition-data.js";
 import { INITIAL_COFFEE_TASK_VALUES, type CafeCoffee } from "../game-data/cafe-data.js";
 import type { Award, BaseAward } from "../game-data/chapter-config.js";
+import {
+  chapterStarAward,
+  chapterStarClaimedMask,
+  chapterStarTaskProgress,
+  chapterStarTaskValue,
+  chapterTotalStars,
+  hasClaimedChapterStarAward,
+  makeChapterStarTaskId,
+  markChapterStarAwardClaimed,
+} from "../game-data/chapter-star-award-data.js";
 import {
   dailySignUpOperationalDate,
   dailySignUpReward,
@@ -51,6 +78,7 @@ import {
   makeGuideTaskId,
   markGuideProgressAwardClaimed,
 } from "../game-data/guide-mission-data.js";
+import { maximumFormationPower } from "../game-data/formation-power-data.js";
 import {
   DEFAULT_TRAINING_OUTDOOR_ID,
   getGirlTrainingConfig,
@@ -64,7 +92,9 @@ export const FIRST_LEVEL_TASK_ID = (1 << 16) | 15;
 export const MONEY_VIGOUR = 1;
 export const MONEY_GOLD = 2;
 export const MONEY_DIAMOND = 3;
+export const MONEY_CARD_DECOMPOSITION_TOKEN = 10;
 export const MONEY_PAY_DIAMOND = 12;
+export const MONEY_WEAPON_DECOMPOSITION_TOKEN = 16;
 export const GACHA_TASK_GROUP = 15;
 export const MAIN_GIRL_TASK_ID = (2 << 16) | 2;
 export const SAVE_SCHEMA_VERSION = 1 as const;
@@ -97,6 +127,7 @@ export interface InventoryEntryState {
   enhanceLevel: number;
   enhanceExp: number;
   breakLevel: number;
+  lockOn: number;
 }
 
 export type CharacterCardState = InventoryEntryState;
@@ -190,6 +221,11 @@ export interface EightDaySignUpState {
   lastOperationalDate: string | null;
 }
 
+export interface BountyState {
+  operationalDate: string;
+  completionCounts: Record<string, number>;
+}
+
 export interface Player {
   account: string;
   roleId: number;
@@ -214,6 +250,7 @@ export interface Player {
   gacha: GachaState;
   dailySignUp: DailySignUpState;
   eightDaySignUp: EightDaySignUpState;
+  bounty?: BountyState;
 }
 
 export interface PersistedState {
@@ -234,6 +271,22 @@ export interface ChapterSettlement {
   updatedMoney: MoneyState[];
   updatedGirls: GirlState[];
   experienceUpdate: PlayerExperienceUpdate;
+}
+
+export interface BountySettlement {
+  player: Player;
+  updatedItems: InventoryItemState[];
+  updatedMoney: MoneyState[];
+  updatedGirls: GirlState[];
+  experienceUpdate: PlayerExperienceUpdate;
+}
+
+export interface ChapterStarAwardResult {
+  player: Player;
+  awards: readonly BaseAward[];
+  updatedItems: InventoryItemState[];
+  updatedMoney: MoneyState[];
+  updatedGirls: GirlState[];
 }
 
 export interface PlayerExperienceUpdate {
@@ -281,6 +334,29 @@ export interface CardEnhancementResult {
   addedExperience: number;
   coinCost: number;
   updatedMoney: MoneyState[];
+}
+
+export interface ItemLockResult {
+  player: Player;
+  item: InventoryItemState;
+}
+
+export interface CharacterCardDecompositionResult {
+  player: Player;
+  removedCards: CharacterCardState[];
+  updatedItems: InventoryItemState[];
+  updatedMoney: MoneyState[];
+  itemList: Gdpln[];
+  gold: number;
+}
+
+export interface WeaponDecompositionResult {
+  player: Player;
+  removedWeapons: InventoryItemState[];
+  updatedItems: InventoryItemState[];
+  updatedMoney: MoneyState[];
+  itemList: Gdpln[];
+  gold: number;
 }
 
 export interface WeaponEnhancementResult {
@@ -339,6 +415,13 @@ export class InsufficientVigourError extends Error {
   }
 }
 
+export class BountySettlementError extends Error {
+  constructor(readonly reason: "key_not_owned") {
+    super(`Bounty settlement error: ${reason}`);
+    this.name = "BountySettlementError";
+  }
+}
+
 export class InsufficientGoldError extends Error {
   constructor(
     readonly required: number,
@@ -353,6 +436,37 @@ export class InsufficientGachaCurrencyError extends Error {
   constructor(readonly poolId: number) {
     super(`Insufficient currency for gacha pool ${poolId}`);
     this.name = "InsufficientGachaCurrencyError";
+  }
+}
+
+export class CharacterCardDecompositionError extends Error {
+  constructor(
+    readonly reason:
+      | "card_not_owned"
+      | "card_locked"
+      | "card_in_formation"
+      | "oath_card"
+      | "unknown_rarity"
+      | "invalid_request",
+    readonly guid: number,
+  ) {
+    super(`Character card decomposition error: ${reason} (${guid})`);
+    this.name = "CharacterCardDecompositionError";
+  }
+}
+
+export class WeaponDecompositionError extends Error {
+  constructor(
+    readonly reason:
+      | "weapon_not_owned"
+      | "weapon_locked"
+      | "weapon_equipped"
+      | "unknown_rarity"
+      | "invalid_request",
+    readonly guid: number,
+  ) {
+    super(`Weapon decomposition error: ${reason} (${guid})`);
+    this.name = "WeaponDecompositionError";
   }
 }
 
@@ -379,6 +493,13 @@ export class GuideMissionError extends Error {
   }
 }
 
+export class ChapterStarAwardError extends Error {
+  constructor(readonly reason: "unknown_award" | "not_completed" | "already_claimed") {
+    super(`Chapter star award error: ${reason}`);
+    this.name = "ChapterStarAwardError";
+  }
+}
+
 interface PlayerRepositoryOptions {
   store: JsonStore<PersistedState>;
   defaults: AppConfig["playerDefaults"];
@@ -399,6 +520,54 @@ function makeInitialPhoneState(): PhoneState {
 
 function makeInitialGachaState(): GachaState {
   return { pending: null };
+}
+
+function makeInitialBountyState(now = Date.now()): BountyState {
+  return {
+    operationalDate: bountyOperationalDate(now),
+    completionCounts: {},
+  };
+}
+
+function reconcileBounty(player: Player, now = Date.now()): void {
+  player.bounty ??= makeInitialBountyState(now);
+  player.bounty.completionCounts ??= {};
+  const operationalDate = bountyOperationalDate(now);
+  const dailyReset = player.bounty.operationalDate !== operationalDate;
+  if (dailyReset) player.bounty.operationalDate = operationalDate;
+  for (const eventType of [1, 2, 4, 5] satisfies BountyEventType[]) {
+    const taskId = String(makeBountyDailyTaskId(eventType));
+    if (dailyReset || player.taskValues[taskId] === undefined) {
+      player.taskValues[taskId] = BOUNTY_DAILY_REWARD_COUNT;
+    }
+  }
+}
+
+function reconcileInventoryLockState(player: Player): void {
+  for (const item of player.inventory) {
+    item.lockOn = item.lockOn === 1 ? 1 : 0;
+  }
+}
+
+function reconcileChapterStarTaskValues(player: Player): void {
+  const coordinates = new Set<string>();
+  for (const level of player.levels) {
+    const chapter = level.id >>> 16;
+    const difficulty = level.id & 0xff;
+    if (chapter > 0 && (difficulty === 1 || difficulty === 2)) {
+      coordinates.add(`${chapter}:${difficulty}`);
+    }
+  }
+
+  for (const coordinate of coordinates) {
+    const [chapter, difficulty] = coordinate.split(":").map(Number);
+    const taskId = makeChapterStarTaskId(chapter!, difficulty!);
+    const currentValue = player.taskValues[String(taskId)] ?? 0;
+    player.taskValues[String(taskId)] = chapterStarTaskValue(
+      chapterTotalStars(player.levels, chapter!, difficulty!),
+      chapterStarClaimedMask(currentValue),
+    );
+  }
 }
 
 function makeGirlTaskId(group: number, girlId: number, offset: number): number {
@@ -658,6 +827,7 @@ function makeStarterRoster(
       enhanceLevel: 1,
       enhanceExp: 0,
       breakLevel: 0,
+      lockOn: 0,
     },
     {
       guid: 10_002,
@@ -670,6 +840,7 @@ function makeStarterRoster(
       enhanceLevel: 1,
       enhanceExp: 0,
       breakLevel: 0,
+      lockOn: 0,
     },
     {
       guid: 10_003,
@@ -682,6 +853,7 @@ function makeStarterRoster(
       enhanceLevel: 1,
       enhanceExp: 0,
       breakLevel: 0,
+      lockOn: 0,
     },
   ];
   const girls: GirlState[] = [7, 9, 2].map((girlId) => ({
@@ -738,6 +910,7 @@ function addInventoryAward(
         enhanceLevel: initialEnhanceLevel(genre),
         enhanceExp: 0,
         breakLevel: 0,
+        lockOn: 0,
       };
       player.inventory.push(item);
       updatedItemGuids.add(item.guid);
@@ -765,6 +938,7 @@ function addInventoryAward(
       enhanceLevel: 0,
       enhanceExp: 0,
       breakLevel: 0,
+      lockOn: 0,
     };
     player.inventory.push(item);
   }
@@ -787,7 +961,11 @@ function grantAwards(
         ? MONEY_GOLD
         : genre === 15 && detail === 2
           ? MONEY_DIAMOND
-          : null;
+          : genre === 15 && detail === 11
+            ? MONEY_CARD_DECOMPOSITION_TOKEN
+            : genre === 15 && detail === 20
+              ? MONEY_WEAPON_DECOMPOSITION_TOKEN
+              : null;
     if (moneyId !== null) {
       let money = player.money.find(({ id }) => id === moneyId);
       if (!money) {
@@ -805,6 +983,13 @@ function grantAwards(
       updatedItemGuids,
     );
   }
+}
+
+function reconcileMaximumFightPower(player: Player): boolean {
+  const maximum = maximumFormationPower(player);
+  if (maximum <= player.fightPower) return false;
+  player.fightPower = maximum;
+  return true;
 }
 
 function deductGachaCost(
@@ -887,8 +1072,12 @@ export class PlayerRepository {
     await this.#store.update((state) => {
       player = state.players[safeAccount];
       if (player) {
+        reconcileInventoryLockState(player);
         reconcileDailySignUp(player);
         reconcileEightDaySignUp(player);
+        reconcileBounty(player);
+        reconcileChapterStarTaskValues(player);
+        reconcileMaximumFightPower(player);
         this.#activities.reconcile(player);
         return;
       }
@@ -923,9 +1112,14 @@ export class PlayerRepository {
         gacha: makeInitialGachaState(),
         dailySignUp: makeInitialDailySignUpState(),
         eightDaySignUp: makeInitialEightDaySignUpState(),
+        bounty: makeInitialBountyState(),
         ...makeStarterRoster(registerTime),
       };
+      reconcileInventoryLockState(player);
       reconcileGirlAppearanceState(player);
+      reconcileBounty(player);
+      reconcileChapterStarTaskValues(player);
+      reconcileMaximumFightPower(player);
       this.#activities.reconcile(player);
       state.players[safeAccount] = player;
       this.#logger.info("player.created", { account: safeAccount, roleId });
@@ -943,8 +1137,12 @@ export class PlayerRepository {
     await this.#store.update((state) => {
       player = state.players[account];
       if (!player) throw new Error(`Unknown player account: ${account}`);
+      reconcileInventoryLockState(player);
       reconcileDailySignUp(player, now);
       reconcileEightDaySignUp(player, now, true);
+      reconcileBounty(player, now);
+      reconcileChapterStarTaskValues(player);
+      reconcileMaximumFightPower(player);
       this.#activities.reconcile(player, now);
       player.lastLoginAt = new Date(now).toISOString();
     });
@@ -1575,6 +1773,244 @@ export class PlayerRepository {
     return structuredClone(player);
   }
 
+  async setItemLock(
+    account: string,
+    guid: number,
+    lockOn: number,
+  ): Promise<ItemLockResult> {
+    if (!Number.isSafeInteger(guid) || guid <= 0 || (lockOn !== 0 && lockOn !== 1)) {
+      throw new Error(`Invalid item lock request: ${guid}/${lockOn}`);
+    }
+
+    let player: Player | undefined;
+    let item: InventoryItemState | undefined;
+    await this.#store.update((state) => {
+      player = state.players[account];
+      if (!player) throw new Error(`Unknown player account: ${account}`);
+      reconcileInventoryLockState(player);
+      item = player.inventory.find(
+        (candidate) => candidate.guid === guid && candidate.count > 0,
+      );
+      if (!item) throw new Error(`Unknown inventory item: ${guid}`);
+      item.lockOn = lockOn;
+    });
+    if (!player || !item) throw new Error(`Failed to update item lock: ${guid}`);
+
+    const snapshot = structuredClone(player);
+    const updatedItem = snapshot.inventory.find((candidate) => candidate.guid === guid);
+    if (!updatedItem) throw new Error(`Locked item disappeared: ${guid}`);
+    this.#logger.info("player.item.lock_updated", { account, guid, lockOn });
+    return { player: snapshot, item: updatedItem };
+  }
+
+  async decomposeCharacterCards(
+    account: string,
+    guids: readonly number[],
+    rarityOf: (gdpl: Gdpl) => number | null,
+  ): Promise<CharacterCardDecompositionResult> {
+    if (
+      guids.length === 0 ||
+      guids.length > MAX_CARD_DECOMPOSITION_COUNT ||
+      guids.some((guid) => !Number.isSafeInteger(guid) || guid <= 0) ||
+      new Set(guids).size !== guids.length
+    ) {
+      throw new CharacterCardDecompositionError("invalid_request", guids[0] ?? 0);
+    }
+
+    let player: Player | undefined;
+    let removedCards: CharacterCardState[] = [];
+    let gold = 0;
+    let tokenCount = 0;
+    const updatedItemGuids = new Set<number>();
+    const updatedMoneyIds = new Set<number>();
+
+    await this.#store.update((state) => {
+      player = state.players[account];
+      if (!player) throw new Error(`Unknown player account: ${account}`);
+      reconcileInventoryLockState(player);
+
+      const formationCardGuids = new Set(
+        player.formations.flatMap(({ fightCards }) =>
+          fightCards.flatMap(({ mainCardGuid, secondaryCardGuids, usedCardGuid }) => [
+            mainCardGuid,
+            usedCardGuid,
+            ...secondaryCardGuids,
+          ]),
+        ),
+      );
+      const cards: CharacterCardState[] = [];
+      for (const guid of guids) {
+        const card = player.inventory.find(
+          (candidate) =>
+            candidate.guid === guid &&
+            candidate.count > 0 &&
+            isCharacterCard(candidate),
+        );
+        if (!card) {
+          throw new CharacterCardDecompositionError("card_not_owned", guid);
+        }
+        if (card.lockOn === 1) {
+          throw new CharacterCardDecompositionError("card_locked", guid);
+        }
+        if (formationCardGuids.has(guid)) {
+          throw new CharacterCardDecompositionError("card_in_formation", guid);
+        }
+        if (card.particular === 17) {
+          throw new CharacterCardDecompositionError("oath_card", guid);
+        }
+        const rarity = rarityOf([
+          card.genre,
+          card.detail,
+          card.particular,
+          card.templateLevel,
+        ]);
+        const reward =
+          rarity === null
+            ? null
+            : characterCardDecompositionReward(card.enhanceLevel, rarity);
+        if (!reward) {
+          throw new CharacterCardDecompositionError("unknown_rarity", guid);
+        }
+        gold += reward.gold;
+        tokenCount += reward.tokenCount;
+        cards.push(card);
+      }
+
+      const removedGuidSet = new Set(guids);
+      removedCards = cards.map((card) => ({ ...card, count: 0 }));
+      player.inventory = player.inventory.filter(
+        ({ guid }) => !removedGuidSet.has(guid),
+      );
+
+      grantAwards(
+        player,
+        [
+          [15, 1, 1, 1, gold],
+          [15, 11, 1, 1, tokenCount],
+        ],
+        updatedItemGuids,
+        updatedMoneyIds,
+      );
+    });
+    if (!player) throw new Error(`Failed to decompose character cards: ${account}`);
+
+    const snapshot = structuredClone(player);
+    const itemList: Gdpln[] = tokenCount > 0 ? [[15, 11, 1, 1, tokenCount]] : [];
+    this.#logger.info("player.card.decomposed", {
+      account,
+      guids,
+      gold,
+      tokenCount,
+    });
+    return {
+      player: snapshot,
+      removedCards: structuredClone(removedCards),
+      updatedItems: snapshot.inventory.filter(({ guid }) => updatedItemGuids.has(guid)),
+      updatedMoney: snapshot.money.filter(({ id }) => updatedMoneyIds.has(id)),
+      itemList,
+      gold,
+    };
+  }
+
+  async decomposeWeapons(
+    account: string,
+    guids: readonly number[],
+    rarityOf: (gdpl: Gdpl) => number | null,
+  ): Promise<WeaponDecompositionResult> {
+    if (
+      guids.length === 0 ||
+      guids.length > MAX_WEAPON_DECOMPOSITION_COUNT ||
+      guids.some((guid) => !Number.isSafeInteger(guid) || guid <= 0) ||
+      new Set(guids).size !== guids.length
+    ) {
+      throw new WeaponDecompositionError("invalid_request", guids[0] ?? 0);
+    }
+
+    let player: Player | undefined;
+    let removedWeapons: InventoryItemState[] = [];
+    let gold = 0;
+    let tokenCount = 0;
+    const updatedItemGuids = new Set<number>();
+    const updatedMoneyIds = new Set<number>();
+
+    await this.#store.update((state) => {
+      player = state.players[account];
+      if (!player) throw new Error(`Unknown player account: ${account}`);
+      reconcileInventoryLockState(player);
+
+      const equippedWeaponGuids = new Set(
+        player.formations.flatMap(({ fightCards }) =>
+          fightCards.map(({ weaponGuid }) => weaponGuid),
+        ),
+      );
+      const weapons: InventoryItemState[] = [];
+      for (const guid of guids) {
+        const weapon = player.inventory.find(
+          (candidate) =>
+            candidate.guid === guid && candidate.count > 0 && isWeapon(candidate),
+        );
+        if (!weapon) {
+          throw new WeaponDecompositionError("weapon_not_owned", guid);
+        }
+        if (weapon.lockOn === 1) {
+          throw new WeaponDecompositionError("weapon_locked", guid);
+        }
+        if (equippedWeaponGuids.has(guid)) {
+          throw new WeaponDecompositionError("weapon_equipped", guid);
+        }
+        const rarity = rarityOf([
+          weapon.genre,
+          weapon.detail,
+          weapon.particular,
+          weapon.templateLevel,
+        ]);
+        const reward =
+          rarity === null
+            ? null
+            : weaponDecompositionReward(weapon.enhanceLevel, rarity);
+        if (!reward) {
+          throw new WeaponDecompositionError("unknown_rarity", guid);
+        }
+        gold += reward.gold;
+        tokenCount += reward.tokenCount;
+        weapons.push(weapon);
+      }
+
+      const removedGuidSet = new Set(guids);
+      removedWeapons = weapons.map((weapon) => ({ ...weapon, count: 0 }));
+      player.inventory = player.inventory.filter(
+        ({ guid }) => !removedGuidSet.has(guid),
+      );
+      grantAwards(
+        player,
+        [
+          [15, 1, 1, 1, gold],
+          [15, 20, 1, 1, tokenCount],
+        ],
+        updatedItemGuids,
+        updatedMoneyIds,
+      );
+    });
+    if (!player) throw new Error(`Failed to decompose weapons: ${account}`);
+
+    const snapshot = structuredClone(player);
+    const itemList: Gdpln[] = tokenCount > 0 ? [[15, 20, 1, 1, tokenCount]] : [];
+    this.#logger.info("player.weapon.decomposed", {
+      account,
+      guids,
+      gold,
+      tokenCount,
+    });
+    return {
+      player: snapshot,
+      removedWeapons: structuredClone(removedWeapons),
+      updatedItems: snapshot.inventory.filter(({ guid }) => updatedItemGuids.has(guid)),
+      updatedMoney: snapshot.money.filter(({ id }) => updatedMoneyIds.has(id)),
+      itemList,
+      gold,
+    };
+  }
+
   async enhanceCard(
     account: string,
     guid: number,
@@ -1637,6 +2073,11 @@ export class PlayerRepository {
       );
       enhancedCard.enhanceLevel = enhanced.level;
       enhancedCard.enhanceExp = enhanced.experience;
+      if (reconcileMaximumFightPower(player)) {
+        this.#activities.dispatch(player, [
+          { type: "fight_power.changed", value: player.fightPower },
+        ]);
+      }
     });
     if (!player || !enhancedCard) {
       throw new Error(`Failed to enhance character card: ${guid}`);
@@ -1775,13 +2216,17 @@ export class PlayerRepository {
       );
       enhancedWeapon.enhanceLevel = enhanced.level;
       enhancedWeapon.enhanceExp = enhanced.experience;
-      this.#activities.dispatch(player, [
+      const events: DomainEvent[] = [
         {
           type: "weapon.enhanced",
           guid,
           level: enhancedWeapon.enhanceLevel,
         },
-      ]);
+      ];
+      if (reconcileMaximumFightPower(player)) {
+        events.push({ type: "fight_power.changed", value: player.fightPower });
+      }
+      this.#activities.dispatch(player, events);
     });
     if (!player || !enhancedWeapon) {
       throw new Error(`Failed to enhance weapon: ${guid}`);
@@ -1846,7 +2291,7 @@ export class PlayerRepository {
       } else {
         player.formations.push(structuredClone(formation));
       }
-      this.#activities.dispatch(player, [
+      const events: DomainEvent[] = [
         {
           type: "formation.updated",
           formationId: formation.id,
@@ -1854,7 +2299,11 @@ export class PlayerRepository {
             ({ weaponGuid }) => weaponGuid > 0,
           ),
         },
-      ]);
+      ];
+      if (reconcileMaximumFightPower(player)) {
+        events.push({ type: "fight_power.changed", value: player.fightPower });
+      }
+      this.#activities.dispatch(player, events);
     });
     this.#logger.info("player.formation.updated", {
       account,
@@ -1919,6 +2368,60 @@ export class PlayerRepository {
     return structuredClone(player);
   }
 
+  async claimChapterStarAward(
+    account: string,
+    chapter: number,
+    difficulty: number,
+    position: number,
+  ): Promise<ChapterStarAwardResult> {
+    const reward = chapterStarAward(chapter, difficulty, position);
+    if (!reward) throw new ChapterStarAwardError("unknown_award");
+
+    let player: Player | undefined;
+    const updatedItemGuids = new Set<number>();
+    const updatedMoneyIds = new Set<number>();
+    const updatedGirlIds = new Set<number>();
+    await this.#store.update((state) => {
+      player = state.players[account];
+      if (!player) throw new Error(`Unknown player account: ${account}`);
+      reconcileChapterStarTaskValues(player);
+
+      const taskId = String(makeChapterStarTaskId(chapter, difficulty));
+      const taskValue = player.taskValues[taskId] ?? 0;
+      if (hasClaimedChapterStarAward(taskValue, position)) {
+        throw new ChapterStarAwardError("already_claimed");
+      }
+      if (chapterStarTaskProgress(taskValue) < reward.requiredStars) {
+        throw new ChapterStarAwardError("not_completed");
+      }
+
+      player.taskValues[taskId] = markChapterStarAwardClaimed(taskValue, position);
+      grantAwards(player, reward.awards, updatedItemGuids, updatedMoneyIds);
+      const girlReconciliation = reconcileGirlAppearanceState(player, updatedItemGuids);
+      for (const girlId of girlReconciliation.updatedGirlIds) {
+        updatedGirlIds.add(girlId);
+      }
+      this.#activities.reconcile(player);
+    });
+    if (!player) throw new Error(`Failed to claim chapter star award: ${account}`);
+
+    const snapshot = structuredClone(player);
+    this.#logger.info("player.chapter_star_award.claimed", {
+      account,
+      chapter,
+      difficulty,
+      position,
+      awards: reward.awards,
+    });
+    return {
+      player: snapshot,
+      awards: reward.awards,
+      updatedItems: snapshot.inventory.filter(({ guid }) => updatedItemGuids.has(guid)),
+      updatedMoney: snapshot.money.filter(({ id }) => updatedMoneyIds.has(id)),
+      updatedGirls: snapshot.girls.filter(({ girlId }) => updatedGirlIds.has(girlId)),
+    };
+  }
+
   async enterLevel(account: string, energyCost: number): Promise<Player> {
     if (!Number.isSafeInteger(energyCost) || energyCost < 0) {
       throw new Error(`Invalid level energy cost: ${energyCost}`);
@@ -1942,6 +2445,111 @@ export class PlayerRepository {
     this.#logger.info("player.level.entered", { account, energyCost });
     if (!player) throw new Error(`Failed to enter level: ${account}`);
     return structuredClone(player);
+  }
+
+  async settleBounty(
+    account: string,
+    level: BountyLevelConfig,
+    awards: readonly Award[],
+    dailyBonusApplied: boolean,
+    keyItem: BaseAward | null,
+  ): Promise<BountySettlement> {
+    let player: Player | undefined;
+    let experienceUpdate: PlayerExperienceUpdate | undefined;
+    const updatedItemGuids = new Set<number>();
+    const updatedMoneyIds = new Set<number>();
+    const updatedGirlIds = new Set<number>();
+    await this.#store.update((state) => {
+      player = state.players[account];
+      if (!player) throw new Error(`Unknown player account: ${account}`);
+      reconcileBounty(player);
+
+      let vigour = player.money.find(({ id }) => id === MONEY_VIGOUR);
+      const available = vigour?.count ?? 0;
+      if (available < level.energyCost) {
+        throw new InsufficientVigourError(level.energyCost, available);
+      }
+      if (!vigour) {
+        vigour = { id: MONEY_VIGOUR, count: 0 };
+        player.money.push(vigour);
+      }
+      vigour.count -= level.energyCost;
+      updatedMoneyIds.add(MONEY_VIGOUR);
+
+      if (keyItem) {
+        const [genre, detail, particular, templateLevel, count] = keyItem;
+        const item = player.inventory.find(
+          (candidate) =>
+            !isInventoryInstance(candidate) &&
+            candidate.genre === genre &&
+            candidate.detail === detail &&
+            candidate.particular === particular &&
+            candidate.templateLevel === templateLevel &&
+            candidate.count >= count,
+        );
+        if (!item) throw new BountySettlementError("key_not_owned");
+        item.count -= count;
+        updatedItemGuids.add(item.guid);
+      }
+
+      grantAwards(
+        player,
+        awards.map(([genre, detail, particular, levelValue, count]) => [
+          genre,
+          detail,
+          particular,
+          levelValue,
+          count,
+        ]),
+        updatedItemGuids,
+        updatedMoneyIds,
+      );
+      const passTaskId = String(makeBountyPassTaskId(level.activityId));
+      player.taskValues[passTaskId] = Math.max(
+        player.taskValues[passTaskId] ?? 0,
+        level.difficulty,
+      );
+      const dailyTaskId = String(makeBountyDailyTaskId(level.eventType));
+      if (dailyBonusApplied) {
+        player.taskValues[dailyTaskId] = Math.max(
+          0,
+          (player.taskValues[dailyTaskId] ?? 0) - 1,
+        );
+      }
+      const completionKey = `${level.activityId}:${level.difficulty}`;
+      player.bounty!.completionCounts[completionKey] =
+        (player.bounty!.completionCounts[completionKey] ?? 0) + 1;
+
+      experienceUpdate = applyPlayerExperience(player, level.masterExp);
+      if (experienceUpdate.vigourRecovery > 0) {
+        updatedMoneyIds.add(MONEY_VIGOUR);
+      }
+      const girlReconciliation = reconcileGirlAppearanceState(player, updatedItemGuids);
+      for (const girlId of girlReconciliation.updatedGirlIds) {
+        updatedGirlIds.add(girlId);
+      }
+    });
+    if (!player || !experienceUpdate) {
+      throw new Error(`Failed to settle bounty: ${account}`);
+    }
+
+    this.#logger.info("player.bounty.settled", {
+      account,
+      activityId: level.activityId,
+      difficulty: level.difficulty,
+      energyCost: level.energyCost,
+      dailyBonusApplied,
+      awards,
+      masterExp: level.masterExp,
+    });
+    const snapshot = structuredClone(player);
+    return {
+      player: snapshot,
+      updatedItems: snapshot.inventory.filter(({ guid }) => updatedItemGuids.has(guid)),
+      updatedMoney: snapshot.money.filter(({ id }) => updatedMoneyIds.has(id)),
+      updatedGirls: snapshot.girls.filter(({ girlId }) => updatedGirlIds.has(girlId)),
+      experienceUpdate,
+    };
   }
 
   async settleLevel(
@@ -1980,6 +2588,7 @@ export class PlayerRepository {
       } else {
         player.levels.push({ id: levelId, star: (1 << 3) | starMask });
       }
+      reconcileChapterStarTaskValues(player);
       if (starMask > 0) {
         this.#activities.dispatch(player, [
           {
@@ -2044,6 +2653,7 @@ export class PlayerRepository {
               enhanceLevel: initialEnhanceLevel(genre),
               enhanceExp: 0,
               breakLevel: 0,
+              lockOn: 0,
             };
             player.inventory.push(item);
             updatedItemGuids.add(item.guid);
@@ -2069,6 +2679,7 @@ export class PlayerRepository {
               enhanceLevel: 0,
               enhanceExp: 0,
               breakLevel: 0,
+              lockOn: 0,
             };
             player.inventory.push(item);
           }
@@ -2132,6 +2743,7 @@ export class PlayerRepository {
       } else {
         player.levels.push({ id: levelId, star: (1 << 3) | starMask });
       }
+      reconcileChapterStarTaskValues(player);
       if (starMask > 0) {
         this.#activities.dispatch(player, [
           {

@@ -53,6 +53,7 @@ describe("game protocol", () => {
         enhanceLevel: 1,
         enhanceExp: 0,
         breakLevel: 0,
+        lockOn: 0,
       },
       {
         guid: 10_002,
@@ -65,6 +66,7 @@ describe("game protocol", () => {
         enhanceLevel: 1,
         enhanceExp: 0,
         breakLevel: 0,
+        lockOn: 1,
       },
       {
         guid: 10_003,
@@ -77,6 +79,7 @@ describe("game protocol", () => {
         enhanceLevel: 1,
         enhanceExp: 0,
         breakLevel: 0,
+        lockOn: 0,
       },
     ],
     girls: [7, 9, 2].map((girlId) => ({
@@ -373,6 +376,7 @@ describe("game protocol", () => {
       [1, 2, 1, 1],
     ]);
     expect(firstNumber(fields, 2)).toBe(3);
+    expect(firstNumber(cards[1]!, 13)).toBe(1);
   });
 
   it("encodes a FormationInfoUpdateNtf", () => {

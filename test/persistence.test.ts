@@ -51,9 +51,14 @@ it("persists player and task changes atomically", async () => {
       "264145": 2,
       "274145": 2,
       "278145": 2,
+      "367702": 4384,
       "460773": 1,
       "470773": 1,
       "474775": 1,
+      "593825": 2,
+      "593826": 2,
+      "593828": 2,
+      "593829": 2,
       "1507329": 256,
       "1507330": 256,
       "1507331": 256,
@@ -84,6 +89,7 @@ it("persists player and task changes atomically", async () => {
     expect(player.inventory).toHaveLength(3);
     expect(player.cafe).toEqual({ coffees: [] });
     expect(player.phone).toEqual({ letters: [] });
+    expect(player.bounty).toMatchObject({ completionCounts: {} });
     const loggedInPlayer = await repository.markLogin("tester");
     expect(loggedInPlayer.lastLoginAt).not.toBeNull();
     const renamedPlayer = await repository.rename("tester", "Commander");

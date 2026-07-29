@@ -1,6 +1,12 @@
 import type { ActivityHandler } from "../activities/activity-engine.js";
 import type { DomainEvent } from "../activities/domain-events.js";
 import type { BaseAward } from "./chapter-config.js";
+import {
+  chapterStarAward,
+  chapterStarTaskProgress,
+  hasClaimedChapterStarAward,
+  makeChapterStarTaskId,
+} from "./chapter-star-award-data.js";
 
 export const GUIDE_MISSION_ACTIVITY_ID = "guide-mission";
 export const GUIDE_MISSION_TASK_GROUP = 5;
@@ -285,6 +291,18 @@ function reconcileGuideMissions(player: GuideMissionPlayer): void {
       .map(({ enhanceLevel }) => enhanceLevel),
   );
   setGuideMissionProgress(player, 40_008, maximumWeaponLevel);
+
+  const chapterTwoFullStarAward = chapterStarAward(2, 1, 3);
+  const chapterTwoStarTask =
+    player.taskValues[String(makeChapterStarTaskId(2, 1))] ?? 0;
+  if (
+    chapterTwoFullStarAward &&
+    chapterStarTaskProgress(chapterTwoStarTask) >=
+      chapterTwoFullStarAward.requiredStars &&
+    hasClaimedChapterStarAward(chapterTwoStarTask, 3)
+  ) {
+    setGuideMissionProgress(player, 40_021, 1);
+  }
 
   if (
     player.formations.some(({ fightCards }) =>

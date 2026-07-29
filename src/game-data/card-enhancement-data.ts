@@ -50,7 +50,7 @@ export const CARD_EXP_MATERIALS: ReadonlyMap<number, ExpMaterialDefinition> = ne
   ),
 );
 
-const CARD_EXP_TO_NEXT_LEVEL = [
+export const CARD_EXP_TO_NEXT_LEVEL = [
   133, 187, 263, 406, 562, 730, 907, 1_092, 1_286, 1_485, 1_691, 1_904, 2_121, 2_345,
   2_573, 2_806, 3_043, 3_285, 3_532, 3_782, 4_035, 4_294, 4_554, 4_820, 5_088, 5_359,
   5_635, 5_912, 6_193, 6_478, 6_764, 7_054, 7_346, 7_641, 7_940, 8_240, 8_542, 8_849,

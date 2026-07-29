@@ -87,6 +87,35 @@ describe("guide mission persistence", () => {
     });
   });
 
+  it("reconciles the maximum formation power from the client formula", async () => {
+    const { repository, store } = await createRepository();
+    await store.update((state) => {
+      const player = state.players.tester;
+      if (!player) throw new Error("missing test player");
+      for (const card of player.inventory.filter(({ genre }) => genre === 1)) {
+        card.enhanceLevel = 50;
+      }
+    });
+
+    const player = await repository.markLogin("tester");
+
+    expect(player.fightPower).toBeGreaterThanOrEqual(3_900);
+    expect(player.taskValues[String(makeGuideTaskId(40_022))]).toBe(7_800);
+  });
+
+  it("completes the chapter-two mission after claiming its full-star box", async () => {
+    const { repository } = await createRepository();
+    for (let index = 1; index <= 6; index += 1) {
+      await repository.completeLevel("tester", 2, index, 1, 7);
+    }
+
+    await repository.claimChapterStarAward("tester", 2, 1, 1);
+    await repository.claimChapterStarAward("tester", 2, 1, 2);
+    const result = await repository.claimChapterStarAward("tester", 2, 1, 3);
+
+    expect(result.player.taskValues[String(makeGuideTaskId(40_021))]).toBe(2);
+  });
+
   it("updates from domain events and enforces sequential mission claims", async () => {
     const { repository } = await createRepository();
     await repository.completeLevel("tester", 1, 1, 1, 3);

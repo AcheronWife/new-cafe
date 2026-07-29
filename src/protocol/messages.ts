@@ -201,6 +201,7 @@ function makeItemInfo(item: InventoryEntryState): Buffer {
     fieldVarint(8, item.enhanceLevel),
     fieldVarint(9, item.enhanceExp),
     fieldVarint(10, item.breakLevel),
+    fieldVarint(13, item.lockOn),
   ]);
 }
 

@@ -3,10 +3,32 @@ import { createServer, type Server, type Socket } from "node:net";
 import type { AppConfig } from "../config.js";
 import { makeBackgroundLuaResponse } from "../game-data/background-lua-data.js";
 import {
+  bountyKeyItem,
+  bountyOperationalDate,
+  getBountyLevel,
+  isBountyOpen,
+  LUA_COMMAND_BOUNTY_FAIL,
+  LUA_COMMAND_BOUNTY_JOIN,
+  LUA_COMMAND_BOUNTY_PASS,
+  makeBountyDailyTaskId,
+  makeBountyPassTaskId,
+  rollBountyRun,
+  thiefAwards,
+  type BountyRun,
+} from "../game-data/bounty-data.js";
+import {
   LUA_COMMAND_CARD_LEVEL_UP_COMMON,
   parseCardEnhancementRequest,
 } from "../game-data/card-enhancement-data.js";
+import {
+  LUA_COMMAND_CARD_DECOMPOSE,
+  parseCardDecompositionRequest,
+} from "../game-data/card-decomposition-data.js";
 import { parseWeaponEnhancementRequest } from "../game-data/weapon-enhancement-data.js";
+import {
+  parseWeaponDecompositionRequest,
+  WEAPON_LOGIC_COMMAND_DECOMPOSE,
+} from "../game-data/weapon-decomposition-data.js";
 import {
   ChapterCatalog,
   effectiveEnergyCost,
@@ -41,12 +63,15 @@ import {
 } from "../game-data/phone-message-data.js";
 import type { Logger } from "../logger.js";
 import {
+  BountySettlementError,
   InsufficientGoldError,
   InsufficientVigourError,
   InsufficientGachaCurrencyError,
   EightDaySignUpError,
   GuideMissionError,
   GirlTrainingError,
+  ChapterStarAwardError,
+  CharacterCardDecompositionError,
   isCharacterCard,
   makeGachaTaskId,
   makeLevelId,
@@ -55,6 +80,7 @@ import {
   type GirlState,
   type Player,
   type PlayerRepository,
+  WeaponDecompositionError,
 } from "../persistence/player-repository.js";
 import { COMMAND, commandName } from "../protocol/commands.js";
 import {
@@ -94,6 +120,15 @@ interface ConnectionContext {
     passCount: number;
   } | null;
   lastSettlement: {
+    key: string;
+    response: Record<string, unknown>;
+  } | null;
+  activeBounty: {
+    run: BountyRun;
+    formationId: number;
+    keyItem: [number, number, number, number, number] | null;
+  } | null;
+  lastBountySettlement: {
     key: string;
     response: Record<string, unknown>;
   } | null;
@@ -316,6 +351,134 @@ function parseNumericLuaCommand(call: LuaCall | null): number | null {
   return Number.isSafeInteger(command) ? command : null;
 }
 
+type BountyCall =
+  | {
+      command: typeof LUA_COMMAND_BOUNTY_JOIN;
+      activityId: number;
+      difficulty: number;
+      formationId: number;
+      keyType: number;
+      parameters: Record<string, unknown>;
+    }
+  | {
+      command: typeof LUA_COMMAND_BOUNTY_PASS | typeof LUA_COMMAND_BOUNTY_FAIL;
+      activityId: number;
+      difficulty: number;
+      formationId: number;
+      keyType: number;
+      parameters: Record<string, unknown>;
+    };
+
+function parseBountyCall(call: LuaCall | null): BountyCall | null {
+  if (
+    call?.method !== "LuaCall" ||
+    typeof call.parameters !== "object" ||
+    call.parameters === null
+  ) {
+    return null;
+  }
+  const wrapper = call.parameters as Record<string, unknown>;
+  const command = Number(wrapper.sCmd);
+  if (
+    command !== LUA_COMMAND_BOUNTY_JOIN &&
+    command !== LUA_COMMAND_BOUNTY_PASS &&
+    command !== LUA_COMMAND_BOUNTY_FAIL
+  ) {
+    return null;
+  }
+  if (typeof wrapper.tbParam !== "object" || wrapper.tbParam === null) return null;
+  const parameters = wrapper.tbParam as Record<string, unknown>;
+  const activityId = Number(
+    command === LUA_COMMAND_BOUNTY_JOIN ? parameters.id : parameters.nActivityId,
+  );
+  const difficulty = Number(
+    command === LUA_COMMAND_BOUNTY_JOIN ? parameters.diff : parameters.nDiff,
+  );
+  const formationId = Number(parameters.nFormationId);
+  const keyType = Number(parameters.key) || 0;
+  if (
+    !Number.isSafeInteger(activityId) ||
+    !Number.isSafeInteger(difficulty) ||
+    !Number.isSafeInteger(formationId)
+  ) {
+    return null;
+  }
+  return {
+    command,
+    activityId,
+    difficulty,
+    formationId,
+    keyType,
+    parameters,
+  };
+}
+
+function hasInventoryAward(
+  player: Player,
+  award: readonly [number, number, number, number, number],
+): boolean {
+  const [genre, detail, particular, templateLevel, count] = award;
+  return player.inventory.some(
+    (item) =>
+      item.genre === genre &&
+      item.detail === detail &&
+      item.particular === particular &&
+      item.templateLevel === templateLevel &&
+      item.count >= count,
+  );
+}
+
+function pickedThiefAwards(
+  run: BountyRun,
+  parameters: Record<string, unknown>,
+): ReturnType<typeof thiefAwards> {
+  const deaths = Array.isArray(parameters.tbThiefDeath) ? parameters.tbThiefDeath : [];
+  const killedMonsters = new Set(
+    deaths.flatMap((entry) => {
+      if (typeof entry !== "object" || entry === null) return [];
+      const value = entry as Record<string, unknown>;
+      return value.bDeath ? [Number(value.monId)] : [];
+    }),
+  );
+  if (!run.thiefDrops.some(({ monId }) => killedMonsters.has(monId))) return [];
+
+  const maximum = new Map(
+    thiefAwards(run.thiefDrops).map((award) => [award.slice(0, 4).join(":"), award]),
+  );
+  const picked = Array.isArray(parameters.tbThiefDropItem)
+    ? parameters.tbThiefDropItem
+    : [];
+  return picked.flatMap((entry) => {
+    if (!Array.isArray(entry) || entry.length < 5) return [];
+    const values = entry.slice(0, 5).map(Number);
+    if (!values.every(Number.isSafeInteger)) return [];
+    const expected = maximum.get(values.slice(0, 4).join(":"));
+    if (!expected) return [];
+    const count = Math.max(0, Math.min(values[4]!, expected[4]));
+    return count > 0
+      ? [[values[0]!, values[1]!, values[2]!, values[3]!, count, 10] as const]
+      : [];
+  });
+}
+
+function parseItemLockCall(
+  call: LuaCall | null,
+): { guid: number; lockOn: number } | null {
+  if (
+    call?.method !== "LockItem" ||
+    typeof call.parameters !== "object" ||
+    call.parameters === null
+  ) {
+    return null;
+  }
+  const parameters = call.parameters as Record<string, unknown>;
+  const guid = Number(parameters.nGuid);
+  const lockOn = Number(parameters.nLockOn);
+  return Number.isSafeInteger(guid) && guid > 0 && (lockOn === 0 || lockOn === 1)
+    ? { guid, lockOn }
+    : null;
+}
+
 export function createGatewayServer({
   config,
   logger,
@@ -335,6 +498,8 @@ export function createGatewayServer({
       isNewPlayer: false,
       activeChapter: null,
       lastSettlement: null,
+      activeBounty: null,
+      lastBountySettlement: null,
     };
     let pending = Buffer.alloc(0);
     let receiveQueue: Promise<void> = Promise.resolve();
@@ -511,6 +676,39 @@ export function createGatewayServer({
           ...(call ? { method: call.method, json: call.json } : {}),
         });
         send(COMMAND.C2S_CALL_RSP, packet.serial);
+        if (call?.method === "LockItem") {
+          const request = parseItemLockCall(call);
+          if (!request) {
+            logger.warn("item.lock.invalid_request", {
+              peer,
+              account: context.account,
+              parameters: call.parameters,
+            });
+            return;
+          }
+          try {
+            const result = await players.setItemLock(
+              context.account,
+              request.guid,
+              request.lockOn,
+            );
+            context.player = result.player;
+            send(COMMAND.ITEM_UPDATE_NTF, 0, makeItemUpdateNotification([result.item]));
+            logger.info("item.lock.updated", {
+              peer,
+              account: context.account,
+              ...request,
+            });
+          } catch (error) {
+            logger.warn("item.lock.rejected", {
+              peer,
+              account: context.account,
+              ...request,
+              reason: error instanceof Error ? error.message : String(error),
+            });
+          }
+          return;
+        }
         if (call?.method === "SignUpMsg") {
           const parameters =
             call.parameters && typeof call.parameters === "object"
@@ -603,11 +801,6 @@ export function createGatewayServer({
               for (const money of result.updatedMoney) {
                 send(COMMAND.MONEY_UPDATE_NTF, 0, makeMoneyUpdateNotification(money));
               }
-              send(
-                COMMAND.TASK_VALUE_RSP,
-                0,
-                makeTaskValueSync(result.player.taskValues),
-              );
               send(
                 COMMAND.NTF_S2C_CALL,
                 0,
@@ -856,6 +1049,87 @@ export function createGatewayServer({
               ? (call.parameters as Record<string, unknown>)
               : {};
           const weaponCommand = Number(parameters.nCmd);
+          if (weaponCommand === WEAPON_LOGIC_COMMAND_DECOMPOSE) {
+            const guids = parseWeaponDecompositionRequest(parameters);
+            if (!guids) {
+              send(
+                COMMAND.NTF_S2C_CALL,
+                0,
+                makeServerLuaCall("WeaponLogicMsg", {
+                  nError: 1,
+                  nCmd: weaponCommand,
+                }),
+              );
+              logger.warn("weapon.decompose.invalid_request", {
+                account: context.account,
+                parameters,
+              });
+              return;
+            }
+            try {
+              const result = await players.decomposeWeapons(
+                context.account,
+                guids,
+                (gdpl) => weaponGachaCatalog.rarityOf(gdpl),
+              );
+              context.player = result.player;
+              const updatedItems = [...result.removedWeapons, ...result.updatedItems];
+              if (updatedItems.length > 0) {
+                send(
+                  COMMAND.ITEM_UPDATE_NTF,
+                  0,
+                  makeItemUpdateNotification(updatedItems),
+                );
+              }
+              for (const money of result.updatedMoney) {
+                send(COMMAND.MONEY_UPDATE_NTF, 0, makeMoneyUpdateNotification(money));
+              }
+              send(
+                COMMAND.TASK_VALUE_RSP,
+                0,
+                makeTaskValueSync(result.player.taskValues),
+              );
+              send(
+                COMMAND.NTF_S2C_CALL,
+                0,
+                makeServerLuaCall("WeaponLogicMsg", {
+                  nError: 0,
+                  nCmd: weaponCommand,
+                  tbParam: [result.gold, result.itemList],
+                }),
+              );
+              logger.info("weapon.decompose.response", {
+                account: context.account,
+                guids,
+                gold: result.gold,
+                itemList: result.itemList,
+              });
+            } catch (error) {
+              if (!(error instanceof WeaponDecompositionError)) throw error;
+              const nError =
+                error.reason === "weapon_locked"
+                  ? 20015
+                  : error.reason === "weapon_equipped"
+                    ? 20016
+                    : 1;
+              send(
+                COMMAND.NTF_S2C_CALL,
+                0,
+                makeServerLuaCall("WeaponLogicMsg", {
+                  nError,
+                  nCmd: weaponCommand,
+                }),
+              );
+              logger.warn("weapon.decompose.rejected", {
+                account: context.account,
+                guids,
+                guid: error.guid,
+                reason: error.reason,
+                nError,
+              });
+            }
+            return;
+          }
           if (weaponCommand === 1) {
             const request = parseWeaponEnhancementRequest(parameters);
             if (!request) {
@@ -889,6 +1163,11 @@ export function createGatewayServer({
               for (const money of result.updatedMoney) {
                 send(COMMAND.MONEY_UPDATE_NTF, 0, makeMoneyUpdateNotification(money));
               }
+              send(
+                COMMAND.TASK_VALUE_RSP,
+                0,
+                makeTaskValueSync(result.player.taskValues),
+              );
               send(
                 COMMAND.NTF_S2C_CALL,
                 0,
@@ -1363,6 +1642,83 @@ export function createGatewayServer({
           }
           return;
         }
+        if (luaCommand === LUA_COMMAND_CARD_DECOMPOSE) {
+          const guids = parseCardDecompositionRequest(call?.parameters);
+          if (!guids) {
+            send(
+              COMMAND.NTF_S2C_CALL,
+              0,
+              makeServerLuaCall("LuaCall", {
+                sCmd: LUA_COMMAND_CARD_DECOMPOSE,
+                tbParam: { itemlist: [], goldnum: 0, errorKey: "Error.1" },
+              }),
+            );
+            logger.warn("card.decompose.invalid_request", {
+              peer,
+              account: context.account,
+              parameters: call?.parameters,
+            });
+            return;
+          }
+          try {
+            const result = await players.decomposeCharacterCards(
+              context.account,
+              guids,
+              (gdpl) => gachaCatalog.rarityOf(gdpl),
+            );
+            context.player = result.player;
+            const updatedItems = [...result.removedCards, ...result.updatedItems];
+            if (updatedItems.length > 0) {
+              send(
+                COMMAND.ITEM_UPDATE_NTF,
+                0,
+                makeItemUpdateNotification(updatedItems),
+              );
+            }
+            for (const money of result.updatedMoney) {
+              send(COMMAND.MONEY_UPDATE_NTF, 0, makeMoneyUpdateNotification(money));
+            }
+            send(
+              COMMAND.NTF_S2C_CALL,
+              0,
+              makeServerLuaCall("LuaCall", {
+                sCmd: LUA_COMMAND_CARD_DECOMPOSE,
+                tbParam: {
+                  itemlist: result.itemList,
+                  goldnum: result.gold,
+                },
+              }),
+            );
+            logger.info("lua.callback", {
+              peer,
+              account: context.account,
+              method: "LuaCall",
+              command: LUA_COMMAND_CARD_DECOMPOSE,
+              feature: "card.decompose",
+              guids,
+              gold: result.gold,
+              itemList: result.itemList,
+            });
+          } catch (error) {
+            if (!(error instanceof CharacterCardDecompositionError)) throw error;
+            send(
+              COMMAND.NTF_S2C_CALL,
+              0,
+              makeServerLuaCall("LuaCall", {
+                sCmd: LUA_COMMAND_CARD_DECOMPOSE,
+                tbParam: { itemlist: [], goldnum: 0, errorKey: "Error.1" },
+              }),
+            );
+            logger.warn("card.decompose.rejected", {
+              peer,
+              account: context.account,
+              guids,
+              guid: error.guid,
+              reason: error.reason,
+            });
+          }
+          return;
+        }
         const backgroundResponse = makeBackgroundLuaResponse(
           luaCommand,
           call?.parameters,
@@ -1461,6 +1817,7 @@ export function createGatewayServer({
           for (const money of result.updatedMoney) {
             send(COMMAND.MONEY_UPDATE_NTF, 0, makeMoneyUpdateNotification(money));
           }
+          send(COMMAND.TASK_VALUE_RSP, 0, makeTaskValueSync(result.player.taskValues));
           send(
             COMMAND.NTF_S2C_CALL,
             0,
@@ -1645,6 +2002,222 @@ export function createGatewayServer({
           }
           return;
         }
+        const bountyCall = parseBountyCall(call);
+        if (bountyCall) {
+          const sendBountyCallback = (parameters: Record<string, unknown>): void => {
+            send(
+              COMMAND.NTF_S2C_CALL,
+              0,
+              makeServerLuaCall("LuaCall", {
+                sCmd: bountyCall.command,
+                tbParam: parameters,
+              }),
+            );
+          };
+
+          if (bountyCall.command === LUA_COMMAND_BOUNTY_JOIN) {
+            const level = getBountyLevel(bountyCall.activityId, bountyCall.difficulty);
+            if (!level) {
+              sendBountyCallback({ nError: 2 });
+              return;
+            }
+            const player = await players.getOrCreate(context.account);
+            context.player = player;
+            if (
+              bountyCall.formationId <= 0 ||
+              !player.formations.some(({ id }) => id === bountyCall.formationId)
+            ) {
+              sendBountyCallback({ nError: 10 });
+              return;
+            }
+            const passDifficulty =
+              player.taskValues[String(makeBountyPassTaskId(bountyCall.activityId))] ??
+              0;
+            if (bountyCall.difficulty > Math.min(6, passDifficulty + 1)) {
+              sendBountyCallback({ nError: 1 });
+              return;
+            }
+
+            let keyItem: [number, number, number, number, number] | null = null;
+            if (!isBountyOpen(bountyCall.activityId)) {
+              keyItem = bountyKeyItem(level.eventType, bountyCall.keyType);
+              if (!keyItem || !hasInventoryAward(player, keyItem)) {
+                sendBountyCallback({ nError: 3 });
+                return;
+              }
+            }
+            const vigour =
+              player.money.find(({ id }) => id === MONEY_VIGOUR)?.count ?? 0;
+            if (vigour < level.energyCost) {
+              sendBountyCallback({ nError: 5 });
+              return;
+            }
+
+            const completionCount =
+              player.bounty?.completionCounts[
+                `${bountyCall.activityId}:${bountyCall.difficulty}`
+              ] ?? 0;
+            const dailyRewardRemaining =
+              player.taskValues[String(makeBountyDailyTaskId(level.eventType))] ?? 0;
+            const run = rollBountyRun(
+              level,
+              [
+                context.account,
+                bountyOperationalDate(),
+                bountyCall.activityId,
+                bountyCall.difficulty,
+                completionCount,
+              ].join(":"),
+              dailyRewardRemaining,
+            );
+            context.activeBounty = {
+              run,
+              formationId: bountyCall.formationId,
+              keyItem,
+            };
+            context.lastBountySettlement = null;
+            sendBountyCallback({
+              nError: 0,
+              tbData: {
+                id: bountyCall.activityId,
+                diff: bountyCall.difficulty,
+              },
+              tbDrop: [],
+              tbDropItems: run.awards,
+              tbSpeThiefDrop: run.thiefDrops,
+            });
+            logger.info("bounty.joined", {
+              account: context.account,
+              activityId: bountyCall.activityId,
+              difficulty: bountyCall.difficulty,
+              formationId: bountyCall.formationId,
+              mapId: level.mapId,
+              dailyBonusApplied: run.dailyBonusApplied,
+              thiefAppeared: run.thiefDrops.length > 0,
+            });
+            return;
+          }
+
+          if (bountyCall.command === LUA_COMMAND_BOUNTY_FAIL) {
+            if (
+              context.activeBounty?.run.level.activityId === bountyCall.activityId &&
+              context.activeBounty.run.level.difficulty === bountyCall.difficulty
+            ) {
+              context.activeBounty = null;
+            }
+            sendBountyCallback({ nError: 0 });
+            logger.info("bounty.failed", {
+              account: context.account,
+              activityId: bountyCall.activityId,
+              difficulty: bountyCall.difficulty,
+            });
+            return;
+          }
+
+          const settlementKey = [
+            bountyCall.activityId,
+            bountyCall.difficulty,
+            bountyCall.formationId,
+          ].join(":");
+          if (
+            !context.activeBounty &&
+            context.lastBountySettlement?.key === settlementKey
+          ) {
+            sendBountyCallback(context.lastBountySettlement.response);
+            return;
+          }
+          const active = context.activeBounty;
+          if (
+            !active ||
+            active.run.level.activityId !== bountyCall.activityId ||
+            active.run.level.difficulty !== bountyCall.difficulty ||
+            active.formationId !== bountyCall.formationId
+          ) {
+            sendBountyCallback({ nError: 6 });
+            return;
+          }
+
+          const requestedGold = Number(bountyCall.parameters.nGold);
+          const pickedGold = Number.isFinite(requestedGold)
+            ? Math.max(0, Math.min(Math.floor(requestedGold), active.run.maximumGold))
+            : active.run.maximumGold;
+          const baseAwards =
+            active.run.level.eventType === 1
+              ? active.run.awards
+                  .filter(([genre, detail]) => genre !== 15 || detail !== 1)
+                  .concat(pickedGold > 0 ? [[15, 1, 1, 1, pickedGold, 100]] : [])
+              : [...active.run.awards];
+          const awards = [
+            ...baseAwards,
+            ...pickedThiefAwards(active.run, bountyCall.parameters),
+          ];
+          try {
+            const settlement = await players.settleBounty(
+              context.account,
+              active.run.level,
+              awards,
+              active.run.dailyBonusApplied,
+              active.keyItem,
+            );
+            context.player = settlement.player;
+            for (const money of settlement.updatedMoney) {
+              send(COMMAND.MONEY_UPDATE_NTF, 0, makeMoneyUpdateNotification(money));
+            }
+            if (settlement.updatedItems.length > 0) {
+              send(
+                COMMAND.ITEM_UPDATE_NTF,
+                0,
+                makeItemUpdateNotification(settlement.updatedItems),
+              );
+            }
+            sendGirlUpdates(settlement.updatedGirls);
+            send(
+              COMMAND.TASK_VALUE_RSP,
+              0,
+              makeTaskValueSync(settlement.player.taskValues),
+            );
+            if (
+              settlement.experienceUpdate.addedExperience > 0 ||
+              settlement.experienceUpdate.levelsGained > 0
+            ) {
+              send(
+                COMMAND.PLAYER_UPDATE_NTF,
+                0,
+                makePlayerUpdateNotification(settlement.player),
+              );
+            }
+            const response = {
+              nError: 0,
+              tbData: awards,
+              nMasterExp: active.run.level.masterExp,
+              nCardExp: 0,
+            };
+            context.lastBountySettlement = {
+              key: settlementKey,
+              response,
+            };
+            context.activeBounty = null;
+            sendBountyCallback(response);
+            logger.info("bounty.passed", {
+              account: context.account,
+              activityId: bountyCall.activityId,
+              difficulty: bountyCall.difficulty,
+              awards,
+              energyCost: active.run.level.energyCost,
+              dailyBonusApplied: active.run.dailyBonusApplied,
+            });
+          } catch (error) {
+            if (error instanceof InsufficientVigourError) {
+              sendBountyCallback({ nError: 5 });
+            } else if (error instanceof BountySettlementError) {
+              sendBountyCallback({ nError: 3 });
+            } else {
+              throw error;
+            }
+          }
+          return;
+        }
+
         const formationUpdate = parseFormationUpdateCall(call, context.player);
         if (formationUpdate) {
           context.player = await players.updateFormation(
@@ -1865,6 +2438,76 @@ export function createGatewayServer({
               playerLevel: context.player?.level,
               playerExp: context.player?.exp,
             });
+          } else if (chapterCall?.state === 2) {
+            const chapter = Number(chapterCall.parameters.Chapter);
+            const difficulty = Number(chapterCall.parameters.Difficult);
+            const position = Number(chapterCall.parameters.Pos);
+            try {
+              const result = await players.claimChapterStarAward(
+                context.account,
+                chapter,
+                difficulty,
+                position,
+              );
+              context.player = result.player;
+              for (const money of result.updatedMoney) {
+                send(COMMAND.MONEY_UPDATE_NTF, 0, makeMoneyUpdateNotification(money));
+              }
+              if (result.updatedItems.length > 0) {
+                send(
+                  COMMAND.ITEM_UPDATE_NTF,
+                  0,
+                  makeItemUpdateNotification(result.updatedItems),
+                );
+              }
+              sendGirlUpdates(result.updatedGirls);
+              send(
+                COMMAND.TASK_VALUE_RSP,
+                0,
+                makeTaskValueSync(result.player.taskValues),
+              );
+              send(
+                COMMAND.NTF_S2C_CALL,
+                0,
+                makeServerLuaCall("ChapterMsg", {
+                  nError: 0,
+                  nState: 2,
+                }),
+              );
+              logger.info("lua.callback", {
+                peer,
+                account: context.account,
+                method: "ChapterMsg",
+                command: "star_award",
+                chapter,
+                difficulty,
+                position,
+                awards: result.awards,
+              });
+            } catch (error) {
+              if (!(error instanceof ChapterStarAwardError)) throw error;
+              const nError =
+                error.reason === "already_claimed"
+                  ? 20033
+                  : error.reason === "not_completed"
+                    ? 20034
+                    : 1;
+              send(
+                COMMAND.NTF_S2C_CALL,
+                0,
+                makeServerLuaCall("ChapterMsg", {
+                  nError,
+                  nState: 2,
+                }),
+              );
+              logger.info("chapter.star_award.rejected", {
+                account: context.account,
+                chapter,
+                difficulty,
+                position,
+                reason: error.reason,
+              });
+            }
           } else if (girlTrainingCall) {
             try {
               const result = await players.startGirlTraining(
