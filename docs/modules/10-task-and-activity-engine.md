@@ -1,0 +1,44 @@
+# 任务值与活动引擎
+
+## 当前完成度
+
+任务同步为**核心可用**；活动引擎是**已落地的基础框架**，当前只有指引日程一个
+生产 handler。
+
+## 任务值
+
+客户端任务键使用 `(group << 16) | taskId`。登录和主动查询会发送完整
+`TASK_VALUE_RSP`；客户端 `TASK_CHANGE_REQ` 可提交批量变更并持久化。
+
+任务值目前同时承担任务进度、功能开关、少女状态、抽卡计数等多种兼容用途。
+
+## 活动引擎
+
+- `DomainEvent` 当前定义关卡通关、武器强化、编队更新和战力变化；
+- `ActivityRegistry` 静态索引事件到 handler，并拒绝重复 handler ID；
+- handler 可提供 `isActive`、`reconcile` 和 `onEvent`；
+- Repository 在同一 `JsonStore.update()` 草稿中派发事件；
+- handler 可继续 emit 事件，引擎以队列处理，单事务上限 256；
+- 返回发生变化的任务 ID 和处理事件数量；
+- HMR/重启只重建静态注册表，不保留玩家闭包监听器。
+
+更详细的扩展约定见 `docs/activity-engine.md`。
+
+## 当前接入
+
+生产注册表只包含 `guide-mission`。关卡、武器和编队已经产生事件；
+`fight_power.changed` 已定义但没有业务生产者。
+
+## 验证
+
+指引日程测试间接验证登录 reconcile、事件推进和领奖持久化。尚无活动引擎注册、
+活跃筛选、事件级联上限的独立单元测试。
+
+## 已知缺口
+
+- 两百多个活动尚未迁入；
+- 没有结构化 `activities` 存档、活动版本、开放/过期和周期状态；
+- 没有通用 count/sum/max/distinct 规则 DSL；
+- 奖励入账尚未作为事件进入级联队列；
+- 没有 event ID、持久化幂等记录或事务 outbox；
+- 客户端可直接写任务值，会绕过活动规则校验。

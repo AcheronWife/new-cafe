@@ -103,6 +103,15 @@ describe("game protocol", () => {
     ],
     levels: [{ id: 65_793, star: 15 }],
     cafe: { coffees: [] },
+    gacha: { pending: null },
+    dailySignUp: {
+      cycle: "1970-01",
+      lastOperationalDate: null,
+    },
+    eightDaySignUp: {
+      cumulativeDays: 0,
+      lastOperationalDate: null,
+    },
     phone: {
       letters: [
         {
@@ -213,6 +222,9 @@ describe("game protocol", () => {
         levels: [],
         cafe: { coffees: [] },
         phone: { letters: [] },
+        gacha: { pending: null },
+        dailySignUp: { cycle: "1970-01", lastOperationalDate: null },
+        eightDaySignUp: { cumulativeDays: 0, lastOperationalDate: null },
       },
       {
         id: 1,
@@ -248,6 +260,9 @@ describe("game protocol", () => {
         levels: [],
         cafe: { coffees: [] },
         phone: { letters: [] },
+        gacha: { pending: null },
+        dailySignUp: { cycle: "1970-01", lastOperationalDate: null },
+        eightDaySignUp: { cumulativeDays: 0, lastOperationalDate: null },
       },
       {
         id: 1,

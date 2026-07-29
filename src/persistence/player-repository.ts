@@ -67,6 +67,7 @@ export const MONEY_DIAMOND = 3;
 export const MONEY_PAY_DIAMOND = 12;
 export const GACHA_TASK_GROUP = 15;
 export const MAIN_GIRL_TASK_ID = (2 << 16) | 2;
+export const SAVE_SCHEMA_VERSION = 1 as const;
 
 const GIRL_STATE_TASK_GROUP = 3;
 const GIRL_SUIT_TASK_GROUP = 4;
@@ -210,13 +211,13 @@ export interface Player {
   levels: LevelState[];
   cafe: CafeState;
   phone: PhoneState;
-  gacha?: GachaState;
-  dailySignUp?: DailySignUpState;
-  eightDaySignUp?: EightDaySignUpState;
+  gacha: GachaState;
+  dailySignUp: DailySignUpState;
+  eightDaySignUp: EightDaySignUpState;
 }
 
 export interface PersistedState {
-  schemaVersion: 10;
+  schemaVersion: typeof SAVE_SCHEMA_VERSION;
   nextRoleId: number;
   players: Record<string, Player>;
   updatedAt: string | null;
@@ -400,15 +401,6 @@ function makeInitialGachaState(): GachaState {
   return { pending: null };
 }
 
-function reconcileLive2DState(player: Player): void {
-  if (!Number.isSafeInteger(player.live2dEnableLevel) || player.live2dEnableLevel < 0) {
-    player.live2dEnableLevel = 3;
-  }
-  if (typeof player.live2dHX !== "boolean") {
-    player.live2dHX = false;
-  }
-}
-
 function makeGirlTaskId(group: number, girlId: number, offset: number): number {
   let taskGroup = group;
   let taskGirlId = girlId;
@@ -528,8 +520,8 @@ function reconcileGirlAppearanceState(
     );
   }
 
-  // Retain legacy girl states that do not have a corresponding card, but make
-  // sure their currently selected model remains usable.
+  // Preserve explicit girl states that do not currently have a corresponding
+  // card, while keeping their selected model usable.
   for (const girl of player.girls) {
     if (ownedModelsByGirl.has(girl.girlId)) continue;
     const modelId = Math.max(1, girl.modelId);
@@ -600,13 +592,18 @@ function makeInitialDailySignUpState(now = Date.now()): DailySignUpState {
   };
 }
 
+function makeInitialEightDaySignUpState(): EightDaySignUpState {
+  return {
+    cumulativeDays: 0,
+    lastOperationalDate: null,
+  };
+}
+
 function reconcileDailySignUp(player: Player, now = Date.now()): void {
   const operationalDate = dailySignUpOperationalDate(now);
   const cycle = operationalDate.slice(0, 7);
   const todayTaskId = String(makeDailySignUpTaskId(DAILY_SIGN_UP_TODAY_TASK));
   const totalTaskId = String(makeDailySignUpTaskId(DAILY_SIGN_UP_TOTAL_TASK));
-  player.dailySignUp ??= makeInitialDailySignUpState(now);
-
   if (player.dailySignUp.cycle !== cycle) {
     player.dailySignUp.cycle = cycle;
     player.dailySignUp.lastOperationalDate = null;
@@ -622,19 +619,6 @@ function reconcileEightDaySignUp(
   now = Date.now(),
   recordLogin = false,
 ): void {
-  const existingProgress = Math.max(
-    0,
-    ...EIGHT_DAY_SIGN_UP_REWARDS.map(({ achievementId }) =>
-      eightDaySignUpProgress(
-        player.taskValues[String(makeEightDaySignUpTaskId(achievementId))] ?? 0,
-      ),
-    ),
-  );
-  player.eightDaySignUp ??= {
-    cumulativeDays: Math.min(8, existingProgress),
-    lastOperationalDate: null,
-  };
-
   const operationalDate = dailySignUpOperationalDate(now);
   if (recordLogin && player.eightDaySignUp.lastOperationalDate !== operationalDate) {
     player.eightDaySignUp.cumulativeDays = Math.min(
@@ -652,91 +636,6 @@ function reconcileEightDaySignUp(
       player.eightDaySignUp.cumulativeDays,
       hasClaimedEightDaySignUpReward(current),
     );
-  }
-}
-
-function hasCompletedLevel(
-  levels: readonly LevelState[],
-  chapter: number,
-  index: number,
-  difficulty: number,
-): boolean {
-  const id = makeLevelId(chapter, index, difficulty);
-  return levels.some((level) => level.id === id && level.star >>> 3 > 0);
-}
-
-function migratePhoneState(player: Player): PhoneState {
-  // Schema 5 did not persist phone state. For old saves, reconstruct the most
-  // likely deterministic guide state from completed chapters.
-  if (hasCompletedLevel(player.levels, 1, 6, 1)) {
-    return {
-      letters: [
-        {
-          topicId: 1,
-          initiator: 111,
-          createTime: unixTime(),
-          replyIds: [],
-        },
-      ],
-    };
-  }
-  if (hasCompletedLevel(player.levels, 1, 5, 1)) {
-    return {
-      letters: [
-        {
-          topicId: 10_001,
-          initiator: 7,
-          createTime: unixTime(),
-          replyIds: [],
-        },
-      ],
-    };
-  }
-  return makeInitialPhoneState();
-}
-
-interface LegacyInventoryPlayer {
-  inventory?: InventoryEntryState[];
-  cards?: CharacterCardState[];
-  items?: InventoryItemState[];
-}
-
-function migrateInventoryState(player: Player): void {
-  const legacy = player as Player & LegacyInventoryPlayer;
-  if (!legacy.inventory) {
-    legacy.inventory = [...(legacy.cards ?? []), ...(legacy.items ?? [])];
-  }
-
-  const migrated: InventoryEntryState[] = [];
-  let nextGuid = Math.max(
-    player.nextItemGuid,
-    ...legacy.inventory.map(({ guid }) => guid + 1),
-  );
-  for (const entry of legacy.inventory) {
-    if (!isInventoryInstance(entry) || entry.count <= 1) {
-      migrated.push({
-        ...entry,
-        count: isInventoryInstance(entry) ? 1 : entry.count,
-      });
-      continue;
-    }
-    migrated.push({ ...entry, count: 1 });
-    for (let index = 1; index < entry.count; index += 1) {
-      migrated.push({ ...entry, guid: nextGuid++, count: 1 });
-    }
-  }
-  player.inventory = migrated;
-  player.nextItemGuid = Math.max(nextGuid, player.nextItemGuid);
-  delete legacy.cards;
-  delete legacy.items;
-}
-
-// Unity character-card instances are born at Level 1, including reward and gacha cards.
-function reconcileCharacterCardLevels(player: Player): void {
-  for (const entry of player.inventory) {
-    if (isCharacterCard(entry) && entry.enhanceLevel < 1) {
-      entry.enhanceLevel = 1;
-    }
   }
 }
 
@@ -988,24 +887,9 @@ export class PlayerRepository {
     await this.#store.update((state) => {
       player = state.players[safeAccount];
       if (player) {
-        migrateInventoryState(player);
-        player.cafe ??= makeInitialCafeState();
-        player.phone ??= migratePhoneState(player);
-        player.gacha ??= makeInitialGachaState();
-        reconcileLive2DState(player);
-        const experienceUpdate = applyPlayerExperience(player, 0);
-        if (experienceUpdate.levelsGained > 0) {
-          this.#logger.info("player.experience.reconciled", {
-            account: safeAccount,
-            ...experienceUpdate,
-          });
-        }
-        reconcileCharacterCardLevels(player);
-        reconcileGirlAppearanceState(player);
         reconcileDailySignUp(player);
         reconcileEightDaySignUp(player);
         this.#activities.reconcile(player);
-        state.schemaVersion = 10;
         return;
       }
 
@@ -1038,12 +922,11 @@ export class PlayerRepository {
         phone: makeInitialPhoneState(),
         gacha: makeInitialGachaState(),
         dailySignUp: makeInitialDailySignUpState(),
+        eightDaySignUp: makeInitialEightDaySignUpState(),
         ...makeStarterRoster(registerTime),
       };
-      reconcileEightDaySignUp(player);
       reconcileGirlAppearanceState(player);
       this.#activities.reconcile(player);
-      state.schemaVersion = 10;
       state.players[safeAccount] = player;
       this.#logger.info("player.created", { account: safeAccount, roleId });
     });
@@ -1276,7 +1159,7 @@ export class PlayerRepository {
       const totalTaskId = String(makeDailySignUpTaskId(DAILY_SIGN_UP_TOTAL_TASK));
       cumulativeCount = Math.max(0, player.taskValues[totalTaskId] ?? 0);
       if (
-        player.dailySignUp?.lastOperationalDate === operationalDate ||
+        player.dailySignUp.lastOperationalDate === operationalDate ||
         player.taskValues[todayTaskId] === 1
       ) {
         return;
@@ -1320,7 +1203,6 @@ export class PlayerRepository {
         updatedGirlIds.add(girlId);
       }
       fresh = true;
-      state.schemaVersion = 10;
     });
     if (!player) throw new Error(`Failed to sign in player: ${account}`);
     const snapshot = structuredClone(player);
@@ -1376,7 +1258,6 @@ export class PlayerRepository {
       for (const girlId of girlReconciliation.updatedGirlIds) {
         updatedGirlIds.add(girlId);
       }
-      state.schemaVersion = 10;
     });
     if (!player) {
       throw new Error(`Failed to claim eight-day sign-up award: ${account}`);
@@ -1438,7 +1319,6 @@ export class PlayerRepository {
       for (const girlId of girlReconciliation.updatedGirlIds) {
         updatedGirlIds.add(girlId);
       }
-      state.schemaVersion = 10;
     });
     if (!player) {
       throw new Error(`Failed to claim guide mission award: ${account}`);
@@ -1488,7 +1368,6 @@ export class PlayerRepository {
       for (const girlId of girlReconciliation.updatedGirlIds) {
         updatedGirlIds.add(girlId);
       }
-      state.schemaVersion = 10;
     });
     if (!player) {
       throw new Error(`Failed to claim guide progress award: ${account}`);
@@ -1519,7 +1398,6 @@ export class PlayerRepository {
     await this.#store.update((state) => {
       player = state.players[account];
       if (!player) throw new Error(`Unknown player account: ${account}`);
-      player.gacha ??= makeInitialGachaState();
       player.gacha.pending = {
         poolId,
         ten,
@@ -1528,7 +1406,6 @@ export class PlayerRepository {
         upPity: roll.counters.upPity,
         total: roll.counters.total,
       };
-      state.schemaVersion = 10;
     });
     if (!player) throw new Error(`Failed to save pending gacha: ${account}`);
     return structuredClone(player);
@@ -1550,7 +1427,6 @@ export class PlayerRepository {
     await this.#store.update((state) => {
       player = state.players[account];
       if (!player) throw new Error(`Unknown player account: ${account}`);
-      player.gacha ??= makeInitialGachaState();
       deductGachaCost(player, pool, ten, updatedItemGuids, updatedMoneyIds);
 
       const pityTask = kind === "weapon" ? 1002 + pool.id : 2 + pool.id;
@@ -1601,7 +1477,6 @@ export class PlayerRepository {
         updatedGirlIds.add(girlId);
       }
       if (fromPending) player.gacha.pending = null;
-      state.schemaVersion = 10;
     });
     if (!player) throw new Error(`Failed to perform gacha: ${account}`);
     const snapshot = structuredClone(player);
@@ -1682,7 +1557,6 @@ export class PlayerRepository {
     await this.#store.update((state) => {
       player = state.players[account];
       if (!player) throw new Error(`Unknown player account: ${account}`);
-      player.cafe ??= makeInitialCafeState();
       const coffee = player.cafe.coffees.find(
         (candidate) => candidate.coffeetype === coffeeType,
       );
@@ -1691,7 +1565,6 @@ export class PlayerRepository {
       } else {
         player.cafe.coffees.push({ coffeetype: coffeeType, count });
       }
-      state.schemaVersion = 10;
     });
     this.#logger.info("player.cafe.coffee_made", {
       account,
@@ -2000,14 +1873,12 @@ export class PlayerRepository {
     await this.#store.update((state) => {
       player = state.players[account];
       if (!player) throw new Error(`Unknown player account: ${account}`);
-      player.phone ??= migratePhoneState(player);
       const letter = player.phone.letters.find(
         (candidate) => candidate.topicId === topicId,
       );
       if (letter && !letter.replyIds.includes(replyId)) {
         letter.replyIds.push(replyId);
       }
-      state.schemaVersion = 10;
     });
     if (!player) throw new Error(`Failed to reply to phone letter: ${account}`);
     return structuredClone(player);
@@ -2018,11 +1889,9 @@ export class PlayerRepository {
     await this.#store.update((state) => {
       player = state.players[account];
       if (!player) throw new Error(`Unknown player account: ${account}`);
-      player.phone ??= migratePhoneState(player);
       player.phone.letters = player.phone.letters.filter(
         (letter) => letter.topicId !== topicId,
       );
-      state.schemaVersion = 10;
     });
     if (!player) throw new Error(`Failed to remove phone letter: ${account}`);
     return structuredClone(player);
@@ -2036,7 +1905,6 @@ export class PlayerRepository {
     await this.#store.update((state) => {
       player = state.players[account];
       if (!player) throw new Error(`Unknown player account: ${account}`);
-      player.phone ??= migratePhoneState(player);
       if (
         !player.phone.letters.some((candidate) => candidate.topicId === letter.topicId)
       ) {
@@ -2046,7 +1914,6 @@ export class PlayerRepository {
           replyIds: [],
         });
       }
-      state.schemaVersion = 10;
     });
     if (!player) throw new Error(`Failed to add phone letter: ${account}`);
     return structuredClone(player);
@@ -2125,7 +1992,6 @@ export class PlayerRepository {
           },
         ]);
       }
-      player.phone ??= migratePhoneState(player);
       if (
         chapter === 1 &&
         index === 5 &&
@@ -2139,7 +2005,6 @@ export class PlayerRepository {
           replyIds: [],
         });
       }
-      state.schemaVersion = 10;
       experienceUpdate = applyPlayerExperience(player, masterExp);
       if (experienceUpdate.vigourRecovery > 0) {
         updatedMoneyIds.add(MONEY_VIGOUR);
@@ -2295,7 +2160,7 @@ export class PlayerRepository {
 
 export function makeInitialState(): PersistedState {
   return {
-    schemaVersion: 10,
+    schemaVersion: SAVE_SCHEMA_VERSION,
     nextRoleId: 1,
     players: {},
     updatedAt: null,

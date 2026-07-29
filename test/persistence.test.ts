@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { expect, it } from "vitest";
@@ -217,7 +217,7 @@ it("persists player and task changes atomically", async () => {
     ]);
 
     const persisted = JSON.parse(await readFile(filePath, "utf8"));
-    expect(persisted.schemaVersion).toBe(10);
+    expect(persisted.schemaVersion).toBe(1);
     expect(persisted.players.tester.name).toBe("Commander");
     expect(persisted.players.tester.live2dEnableLevel).toBe(3);
     expect(persisted.players.tester.live2dHX).toBe(false);
@@ -246,54 +246,7 @@ it("persists player and task changes atomically", async () => {
       enhanceExp: 167,
     });
 
-    const legacyPlayer = persisted.players.tester;
-    legacyPlayer.cards = legacyPlayer.inventory.filter(
-      ({ guid }: { guid: number }) => guid <= 10_003,
-    );
-    legacyPlayer.items = legacyPlayer.inventory.filter(
-      ({ guid }: { guid: number }) => guid > 10_003,
-    );
-    delete legacyPlayer.inventory;
-    delete legacyPlayer.live2dEnableLevel;
-    delete legacyPlayer.live2dHX;
-    persisted.schemaVersion = 6;
-    await writeFile(filePath, `${JSON.stringify(persisted, null, 2)}\n`, "utf8");
-
-    const migratedStore = new JsonStore({
-      filePath,
-      initialState: makeInitialState(),
-      logger,
-    });
-    await migratedStore.initialize();
-    const migratedRepository = new PlayerRepository({
-      store: migratedStore,
-      defaults: {
-        name: "",
-        level: 1,
-        exp: 0,
-        fightPower: 0,
-        serverZone: 8,
-        firstLevelComplete: false,
-      },
-      logger,
-    });
-    const migratedPlayer = await migratedRepository.getOrCreate("tester");
-    expect(migratedPlayer.inventory).toHaveLength(
-      legacyPlayer.cards.length + legacyPlayer.items.length,
-    );
-    expect(migratedPlayer.inventory.find(({ guid }) => guid === 10_003)).toMatchObject({
-      genre: 1,
-      enhanceLevel: 4,
-      enhanceExp: 167,
-    });
-    expect(migratedPlayer.live2dEnableLevel).toBe(3);
-    expect(migratedPlayer.live2dHX).toBe(false);
-    const migratedDocument = JSON.parse(await readFile(filePath, "utf8"));
-    expect(migratedDocument.schemaVersion).toBe(10);
-    expect(migratedDocument.players.tester).not.toHaveProperty("cards");
-    expect(migratedDocument.players.tester).not.toHaveProperty("items");
-
-    const rosterSettlement = await migratedRepository.settleLevel(
+    const rosterSettlement = await repository.settleLevel(
       "tester",
       1,
       2,
