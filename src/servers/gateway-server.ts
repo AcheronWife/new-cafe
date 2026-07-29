@@ -45,6 +45,7 @@ import {
   InsufficientVigourError,
   InsufficientGachaCurrencyError,
   EightDaySignUpError,
+  GuideMissionError,
   GirlTrainingError,
   isCharacterCard,
   makeGachaTaskId,
@@ -603,6 +604,11 @@ export function createGatewayServer({
                 send(COMMAND.MONEY_UPDATE_NTF, 0, makeMoneyUpdateNotification(money));
               }
               send(
+                COMMAND.TASK_VALUE_RSP,
+                0,
+                makeTaskValueSync(result.player.taskValues),
+              );
+              send(
                 COMMAND.NTF_S2C_CALL,
                 0,
                 makeServerLuaCall("MissionMgrMsg", {
@@ -639,6 +645,75 @@ export function createGatewayServer({
             }
             return;
           }
+        }
+        if (
+          call?.method === "GuideMissionGetAward" ||
+          call?.method === "GuideProgressGetAward"
+        ) {
+          const parameters =
+            call.parameters && typeof call.parameters === "object"
+              ? (call.parameters as Record<string, unknown>)
+              : {};
+          const id = Number(parameters.nId);
+          const missionType = call.method === "GuideMissionGetAward" ? 3 : 4;
+          try {
+            const result =
+              call.method === "GuideMissionGetAward"
+                ? await players.claimGuideMissionAward(context.account, id)
+                : await players.claimGuideProgressAward(context.account, id);
+            context.player = result.player;
+            send(
+              COMMAND.TASK_VALUE_RSP,
+              0,
+              makeTaskValueSync(result.player.taskValues),
+            );
+            if (result.updatedItems.length > 0) {
+              send(
+                COMMAND.ITEM_UPDATE_NTF,
+                0,
+                makeItemUpdateNotification(result.updatedItems),
+              );
+            }
+            for (const money of result.updatedMoney) {
+              send(COMMAND.MONEY_UPDATE_NTF, 0, makeMoneyUpdateNotification(money));
+            }
+            sendGirlUpdates(result.updatedGirls);
+            send(
+              COMMAND.NTF_S2C_CALL,
+              0,
+              makeServerLuaCall("MissionMgrMsg", {
+                nError: 0,
+                nMission: missionType,
+              }),
+            );
+            logger.info("lua.callback", {
+              peer,
+              account: context.account,
+              method: "MissionMgrMsg",
+              feature:
+                missionType === 3 ? "guide_mission.award" : "guide_progress.award",
+              id,
+              awards: result.awards,
+            });
+          } catch (error) {
+            if (!(error instanceof GuideMissionError)) throw error;
+            send(
+              COMMAND.NTF_S2C_CALL,
+              0,
+              makeServerLuaCall("MissionMgrMsg", {
+                nError: 1,
+                nMission: missionType,
+              }),
+            );
+            logger.warn("guide_mission.claim_rejected", {
+              peer,
+              account: context.account,
+              method: call.method,
+              id,
+              reason: error.reason,
+            });
+          }
+          return;
         }
         if (call?.method === "Lottery" || call?.method === "GetFirstGacha") {
           const parameters =
@@ -1581,6 +1656,7 @@ export function createGatewayServer({
             0,
             makeFormationUpdateNotification(formationUpdate.formation),
           );
+          send(COMMAND.TASK_VALUE_RSP, 0, makeTaskValueSync(context.player.taskValues));
           send(
             COMMAND.NTF_S2C_CALL,
             0,

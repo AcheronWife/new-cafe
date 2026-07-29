@@ -1,4 +1,5 @@
 import type { AppConfig } from "../config.js";
+import { createDefaultActivityEngine } from "../activities/default-activity-engine.js";
 import {
   addCardExperience,
   CARD_EXP_MATERIALS,
@@ -39,6 +40,17 @@ import type {
   Gdpl,
   Gdpln,
 } from "../game-data/gacha-data.js";
+import {
+  completedGuideMissionCount,
+  guideMission,
+  guideMissionProgress,
+  guideProgressAward,
+  hasClaimedGuideMission,
+  hasClaimedGuideProgressAward,
+  makeGuideMissionTaskValue,
+  makeGuideTaskId,
+  markGuideProgressAwardClaimed,
+} from "../game-data/guide-mission-data.js";
 import {
   DEFAULT_TRAINING_OUTDOOR_ID,
   getGirlTrainingConfig,
@@ -307,6 +319,15 @@ export interface EightDaySignUpAwardResult {
   updatedGirls: GirlState[];
 }
 
+export interface GuideAwardResult {
+  player: Player;
+  id: number;
+  awards: readonly BaseAward[];
+  updatedItems: InventoryItemState[];
+  updatedMoney: MoneyState[];
+  updatedGirls: GirlState[];
+}
+
 export class InsufficientVigourError extends Error {
   constructor(
     readonly required: number,
@@ -340,6 +361,20 @@ export class EightDaySignUpError extends Error {
   ) {
     super(`Eight-day sign-up error: ${reason}`);
     this.name = "EightDaySignUpError";
+  }
+}
+
+export class GuideMissionError extends Error {
+  constructor(
+    readonly reason:
+      | "unknown_mission"
+      | "unknown_progress_award"
+      | "prerequisite_not_claimed"
+      | "not_completed"
+      | "already_claimed",
+  ) {
+    super(`Guide mission error: ${reason}`);
+    this.name = "GuideMissionError";
   }
 }
 
@@ -939,6 +974,7 @@ export class PlayerRepository {
   readonly #store: JsonStore<PersistedState>;
   readonly #defaults: AppConfig["playerDefaults"];
   readonly #logger: Logger;
+  readonly #activities = createDefaultActivityEngine();
 
   constructor({ store, defaults, logger }: PlayerRepositoryOptions) {
     this.#store = store;
@@ -968,6 +1004,7 @@ export class PlayerRepository {
         reconcileGirlAppearanceState(player);
         reconcileDailySignUp(player);
         reconcileEightDaySignUp(player);
+        this.#activities.reconcile(player);
         state.schemaVersion = 10;
         return;
       }
@@ -1005,6 +1042,7 @@ export class PlayerRepository {
       };
       reconcileEightDaySignUp(player);
       reconcileGirlAppearanceState(player);
+      this.#activities.reconcile(player);
       state.schemaVersion = 10;
       state.players[safeAccount] = player;
       this.#logger.info("player.created", { account: safeAccount, roleId });
@@ -1024,6 +1062,7 @@ export class PlayerRepository {
       if (!player) throw new Error(`Unknown player account: ${account}`);
       reconcileDailySignUp(player, now);
       reconcileEightDaySignUp(player, now, true);
+      this.#activities.reconcile(player, now);
       player.lastLoginAt = new Date(now).toISOString();
     });
     if (!player) throw new Error(`Failed to mark player login: ${account}`);
@@ -1352,6 +1391,118 @@ export class PlayerRepository {
       player: snapshot,
       achievementId,
       awards: reward.awards,
+      updatedItems: snapshot.inventory.filter(({ guid }) => updatedItemGuids.has(guid)),
+      updatedMoney: snapshot.money.filter(({ id }) => updatedMoneyIds.has(id)),
+      updatedGirls: snapshot.girls.filter(({ girlId }) => updatedGirlIds.has(girlId)),
+    };
+  }
+
+  async claimGuideMissionAward(
+    account: string,
+    missionId: number,
+  ): Promise<GuideAwardResult> {
+    const mission = guideMission(missionId);
+    if (!mission) throw new GuideMissionError("unknown_mission");
+
+    let player: Player | undefined;
+    const updatedItemGuids = new Set<number>();
+    const updatedMoneyIds = new Set<number>();
+    const updatedGirlIds = new Set<number>();
+    await this.#store.update((state) => {
+      player = state.players[account];
+      if (!player) throw new Error(`Unknown player account: ${account}`);
+      this.#activities.reconcile(player);
+
+      const taskId = String(makeGuideTaskId(mission.id));
+      const taskValue = player.taskValues[taskId] ?? 0;
+      if (hasClaimedGuideMission(taskValue)) {
+        throw new GuideMissionError("already_claimed");
+      }
+      if (guideMissionProgress(taskValue) < mission.target) {
+        throw new GuideMissionError("not_completed");
+      }
+      if (mission.prerequisiteId > 0) {
+        const prerequisiteValue =
+          player.taskValues[String(makeGuideTaskId(mission.prerequisiteId))] ?? 0;
+        if (!hasClaimedGuideMission(prerequisiteValue)) {
+          throw new GuideMissionError("prerequisite_not_claimed");
+        }
+      }
+
+      player.taskValues[taskId] = makeGuideMissionTaskValue(
+        guideMissionProgress(taskValue),
+        true,
+      );
+      grantAwards(player, mission.awards, updatedItemGuids, updatedMoneyIds);
+      const girlReconciliation = reconcileGirlAppearanceState(player, updatedItemGuids);
+      for (const girlId of girlReconciliation.updatedGirlIds) {
+        updatedGirlIds.add(girlId);
+      }
+      state.schemaVersion = 10;
+    });
+    if (!player) {
+      throw new Error(`Failed to claim guide mission award: ${account}`);
+    }
+    const snapshot = structuredClone(player);
+    this.#logger.info("player.guide_mission.claimed", {
+      account,
+      missionId,
+      awards: mission.awards,
+    });
+    return {
+      player: snapshot,
+      id: missionId,
+      awards: mission.awards,
+      updatedItems: snapshot.inventory.filter(({ guid }) => updatedItemGuids.has(guid)),
+      updatedMoney: snapshot.money.filter(({ id }) => updatedMoneyIds.has(id)),
+      updatedGirls: snapshot.girls.filter(({ girlId }) => updatedGirlIds.has(girlId)),
+    };
+  }
+
+  async claimGuideProgressAward(
+    account: string,
+    awardId: number,
+  ): Promise<GuideAwardResult> {
+    const award = guideProgressAward(awardId);
+    if (!award) throw new GuideMissionError("unknown_progress_award");
+
+    let player: Player | undefined;
+    const updatedItemGuids = new Set<number>();
+    const updatedMoneyIds = new Set<number>();
+    const updatedGirlIds = new Set<number>();
+    await this.#store.update((state) => {
+      player = state.players[account];
+      if (!player) throw new Error(`Unknown player account: ${account}`);
+      this.#activities.reconcile(player);
+
+      if (hasClaimedGuideProgressAward(player, awardId)) {
+        throw new GuideMissionError("already_claimed");
+      }
+      if (completedGuideMissionCount(player) < award.requiredCompleted) {
+        throw new GuideMissionError("not_completed");
+      }
+
+      markGuideProgressAwardClaimed(player, awardId);
+      grantAwards(player, award.awards, updatedItemGuids, updatedMoneyIds);
+      const girlReconciliation = reconcileGirlAppearanceState(player, updatedItemGuids);
+      for (const girlId of girlReconciliation.updatedGirlIds) {
+        updatedGirlIds.add(girlId);
+      }
+      state.schemaVersion = 10;
+    });
+    if (!player) {
+      throw new Error(`Failed to claim guide progress award: ${account}`);
+    }
+    const snapshot = structuredClone(player);
+    this.#logger.info("player.guide_progress.claimed", {
+      account,
+      awardId,
+      awards: award.awards,
+    });
+    return {
+      player: snapshot,
+      id: awardId,
+      awards: award.awards,
       updatedItems: snapshot.inventory.filter(({ guid }) => updatedItemGuids.has(guid)),
       updatedMoney: snapshot.money.filter(({ id }) => updatedMoneyIds.has(id)),
       updatedGirls: snapshot.girls.filter(({ girlId }) => updatedGirlIds.has(girlId)),
@@ -1751,6 +1902,13 @@ export class PlayerRepository {
       );
       enhancedWeapon.enhanceLevel = enhanced.level;
       enhancedWeapon.enhanceExp = enhanced.experience;
+      this.#activities.dispatch(player, [
+        {
+          type: "weapon.enhanced",
+          guid,
+          level: enhancedWeapon.enhanceLevel,
+        },
+      ]);
     });
     if (!player || !enhancedWeapon) {
       throw new Error(`Failed to enhance weapon: ${guid}`);
@@ -1815,6 +1973,15 @@ export class PlayerRepository {
       } else {
         player.formations.push(structuredClone(formation));
       }
+      this.#activities.dispatch(player, [
+        {
+          type: "formation.updated",
+          formationId: formation.id,
+          hasEquippedWeapon: formation.fightCards.some(
+            ({ weaponGuid }) => weaponGuid > 0,
+          ),
+        },
+      ]);
     });
     this.#logger.info("player.formation.updated", {
       account,
@@ -1939,11 +2106,24 @@ export class PlayerRepository {
       if (!player) throw new Error(`Unknown player account: ${account}`);
 
       const level = player.levels.find(({ id }) => id === levelId);
+      const firstClear = !level || level.star >>> 3 === 0;
       if (level) {
         const passCount = Math.min((level.star >>> 3) + 1, 0x0fffffff);
         level.star = (passCount << 3) | (level.star & 0b111) | starMask;
       } else {
         player.levels.push({ id: levelId, star: (1 << 3) | starMask });
+      }
+      if (starMask > 0) {
+        this.#activities.dispatch(player, [
+          {
+            type: "level.cleared",
+            chapter,
+            index,
+            difficulty,
+            stars: starMask,
+            firstClear,
+          },
+        ]);
       }
       player.phone ??= migratePhoneState(player);
       if (
@@ -2080,11 +2260,24 @@ export class PlayerRepository {
       if (!player) throw new Error(`Unknown player account: ${account}`);
 
       const level = player.levels.find(({ id }) => id === levelId);
+      const firstClear = !level || level.star >>> 3 === 0;
       if (level) {
         const passCount = Math.min((level.star >>> 3) + 1, 0x0fffffff);
         level.star = (passCount << 3) | (level.star & 0b111) | starMask;
       } else {
         player.levels.push({ id: levelId, star: (1 << 3) | starMask });
+      }
+      if (starMask > 0) {
+        this.#activities.dispatch(player, [
+          {
+            type: "level.cleared",
+            chapter,
+            index,
+            difficulty,
+            stars: starMask,
+            firstClear,
+          },
+        ]);
       }
     });
     this.#logger.info("player.level.completed", {
