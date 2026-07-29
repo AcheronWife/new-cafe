@@ -37,7 +37,7 @@ it("settles bounty energy, rewards, progress and daily bonus atomically", async 
       store,
       defaults: {
         name: "",
-        level: 35,
+        level: 34,
         exp: 0,
         fightPower: 0,
         serverZone: 8,
@@ -59,7 +59,8 @@ it("settles bounty energy, rewards, progress and daily bonus atomically", async 
       null,
     );
 
-    expect(settled.player.money.find(({ id }) => id === 1)?.count).toBe(18);
+    expect(settled.energyCost).toBe(5);
+    expect(settled.player.money.find(({ id }) => id === 1)?.count).toBe(23);
     expect(settled.player.money.find(({ id }) => id === 2)?.count).toBe(18_000);
     expect(settled.player.taskValues[String(makeBountyPassTaskId(1))]).toBe(1);
     expect(settled.player.taskValues[String(makeBountyDailyTaskId(1))]).toBe(1);

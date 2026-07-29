@@ -5,6 +5,7 @@ import { makeBackgroundLuaResponse } from "../game-data/background-lua-data.js";
 import {
   bountyKeyItem,
   bountyOperationalDate,
+  effectiveBountyEnergyCost,
   getBountyLevel,
   isBountyOpen,
   LUA_COMMAND_BOUNTY_FAIL,
@@ -72,6 +73,7 @@ import {
   GirlTrainingError,
   ChapterStarAwardError,
   CharacterCardDecompositionError,
+  DailyMissionError,
   isCharacterCard,
   makeGachaTaskId,
   makeLevelId,
@@ -151,7 +153,7 @@ function hexPreview(buffer: Buffer, maxBytes: number): HexPreview {
   };
 }
 
-interface LuaCall {
+export interface LuaCall {
   method: string;
   json: string;
   parameters: unknown;
@@ -369,7 +371,7 @@ type BountyCall =
       parameters: Record<string, unknown>;
     };
 
-function parseBountyCall(call: LuaCall | null): BountyCall | null {
+export function parseBountyCall(call: LuaCall | null): BountyCall | null {
   if (
     call?.method !== "LuaCall" ||
     typeof call.parameters !== "object" ||
@@ -377,7 +379,14 @@ function parseBountyCall(call: LuaCall | null): BountyCall | null {
   ) {
     return null;
   }
-  const wrapper = call.parameters as Record<string, unknown>;
+  let wrapper = call.parameters as Record<string, unknown>;
+  if (
+    Number(wrapper.sCmd) === 252 &&
+    typeof wrapper.tbParam === "object" &&
+    wrapper.tbParam !== null
+  ) {
+    wrapper = wrapper.tbParam as Record<string, unknown>;
+  }
   const command = Number(wrapper.sCmd);
   if (
     command !== LUA_COMMAND_BOUNTY_JOIN &&
@@ -838,6 +847,100 @@ export function createGatewayServer({
             }
             return;
           }
+        }
+        if (
+          call?.method === "MissionGetAward" ||
+          call?.method === "MissionActiveAward"
+        ) {
+          const parameters =
+            call.parameters && typeof call.parameters === "object"
+              ? (call.parameters as Record<string, unknown>)
+              : {};
+          const id = Number(parameters.nId);
+          const claimAll =
+            call.method === "MissionGetAward" &&
+            id === 0 &&
+            Number(parameters.nType) === 1;
+          const missionType = call.method === "MissionGetAward" ? 1 : 2;
+          try {
+            const result =
+              call.method === "MissionGetAward"
+                ? await players.claimDailyMissionAwards(context.account, id, claimAll)
+                : await players.claimDailyMissionActiveAward(context.account, id);
+            context.player = result.player;
+            send(
+              COMMAND.TASK_VALUE_RSP,
+              0,
+              makeTaskValueSync(result.player.taskValues),
+            );
+            if (result.updatedItems.length > 0) {
+              send(
+                COMMAND.ITEM_UPDATE_NTF,
+                0,
+                makeItemUpdateNotification(result.updatedItems),
+              );
+            }
+            for (const money of result.updatedMoney) {
+              send(COMMAND.MONEY_UPDATE_NTF, 0, makeMoneyUpdateNotification(money));
+            }
+            sendGirlUpdates(result.updatedGirls);
+
+            if (result.claimedMissionIds.length > 0) {
+              send(
+                COMMAND.NTF_S2C_CALL,
+                0,
+                makeServerLuaCall("MissionMgrMsg", {
+                  nError: 0,
+                  nMission: 1,
+                  ...(claimAll ? { tbIdList: result.claimedMissionIds } : {}),
+                }),
+              );
+            }
+            if (result.claimedActiveAwardIds.length > 0) {
+              send(
+                COMMAND.NTF_S2C_CALL,
+                0,
+                makeServerLuaCall("MissionMgrMsg", {
+                  nError: 0,
+                  nMission: 2,
+                  ...(claimAll ? { tbItems: result.activeAwardItems } : {}),
+                }),
+              );
+            }
+            logger.info("lua.callback", {
+              peer,
+              account: context.account,
+              method: "MissionMgrMsg",
+              feature: claimAll
+                ? "daily_mission.claim_all"
+                : missionType === 1
+                  ? "daily_mission.award"
+                  : "daily_mission.active_award",
+              id,
+              claimedMissionIds: result.claimedMissionIds,
+              claimedActiveAwardIds: result.claimedActiveAwardIds,
+              activeAwardItems: result.activeAwardItems,
+            });
+          } catch (error) {
+            if (!(error instanceof DailyMissionError)) throw error;
+            send(
+              COMMAND.NTF_S2C_CALL,
+              0,
+              makeServerLuaCall("MissionMgrMsg", {
+                nError: 1,
+                nMission: missionType,
+              }),
+            );
+            logger.warn("daily_mission.claim_rejected", {
+              peer,
+              account: context.account,
+              method: call.method,
+              id,
+              claimAll,
+              reason: error.reason,
+            });
+          }
+          return;
         }
         if (
           call?.method === "GuideMissionGetAward" ||
@@ -1910,6 +2013,7 @@ export function createGatewayServer({
           const coffeeType = Number(parameters?.coffeetype);
           const count = Number(parameters?.count);
           context.player = await players.makeCoffee(context.account, coffeeType, count);
+          send(COMMAND.TASK_VALUE_RSP, 0, makeTaskValueSync(context.player.taskValues));
           send(
             COMMAND.NTF_S2C_CALL,
             0,
@@ -2048,7 +2152,8 @@ export function createGatewayServer({
             }
             const vigour =
               player.money.find(({ id }) => id === MONEY_VIGOUR)?.count ?? 0;
-            if (vigour < level.energyCost) {
+            const energyCost = effectiveBountyEnergyCost(level, player.level);
+            if (vigour < energyCost) {
               sendBountyCallback({ nError: 5 });
               return;
             }
@@ -2092,6 +2197,7 @@ export function createGatewayServer({
               difficulty: bountyCall.difficulty,
               formationId: bountyCall.formationId,
               mapId: level.mapId,
+              energyCost,
               dailyBonusApplied: run.dailyBonusApplied,
               thiefAppeared: run.thiefDrops.length > 0,
             });
@@ -2126,9 +2232,52 @@ export function createGatewayServer({
             sendBountyCallback(context.lastBountySettlement.response);
             return;
           }
-          const active = context.activeBounty;
+          let active = context.activeBounty;
+          if (!active) {
+            const level = getBountyLevel(bountyCall.activityId, bountyCall.difficulty);
+            const player = await players.getOrCreate(context.account);
+            if (
+              !level ||
+              !player.formations.some(({ id }) => id === bountyCall.formationId)
+            ) {
+              sendBountyCallback({ nError: 6 });
+              return;
+            }
+            let keyItem: [number, number, number, number, number] | null = null;
+            if (!isBountyOpen(bountyCall.activityId)) {
+              keyItem = bountyKeyItem(level.eventType, bountyCall.keyType);
+              if (!keyItem || !hasInventoryAward(player, keyItem)) {
+                sendBountyCallback({ nError: 3 });
+                return;
+              }
+            }
+            const completionCount =
+              player.bounty?.completionCounts[
+                `${bountyCall.activityId}:${bountyCall.difficulty}`
+              ] ?? 0;
+            active = {
+              run: rollBountyRun(
+                level,
+                [
+                  context.account,
+                  bountyOperationalDate(),
+                  bountyCall.activityId,
+                  bountyCall.difficulty,
+                  completionCount,
+                ].join(":"),
+                player.taskValues[String(makeBountyDailyTaskId(level.eventType))] ?? 0,
+              ),
+              formationId: bountyCall.formationId,
+              keyItem,
+            };
+            context.activeBounty = active;
+            logger.info("bounty.session.recovered", {
+              account: context.account,
+              activityId: bountyCall.activityId,
+              difficulty: bountyCall.difficulty,
+            });
+          }
           if (
-            !active ||
             active.run.level.activityId !== bountyCall.activityId ||
             active.run.level.difficulty !== bountyCall.difficulty ||
             active.formationId !== bountyCall.formationId
@@ -2137,14 +2286,23 @@ export function createGatewayServer({
             return;
           }
 
+          const randomGoldLimit = active.run.awards
+            .filter(
+              ([genre, detail, , , , flag]) =>
+                genre === 15 && detail === 1 && flag === 7,
+            )
+            .reduce((total, award) => total + award[4], 0);
           const requestedGold = Number(bountyCall.parameters.nGold);
           const pickedGold = Number.isFinite(requestedGold)
-            ? Math.max(0, Math.min(Math.floor(requestedGold), active.run.maximumGold))
-            : active.run.maximumGold;
+            ? Math.max(0, Math.min(Math.floor(requestedGold), randomGoldLimit))
+            : randomGoldLimit;
           const baseAwards =
             active.run.level.eventType === 1
               ? active.run.awards
-                  .filter(([genre, detail]) => genre !== 15 || detail !== 1)
+                  .filter(
+                    ([genre, detail, , , , flag]) =>
+                      genre !== 15 || detail !== 1 || flag !== 7,
+                  )
                   .concat(pickedGold > 0 ? [[15, 1, 1, 1, pickedGold, 100]] : [])
               : [...active.run.awards];
           const awards = [
@@ -2203,7 +2361,7 @@ export function createGatewayServer({
               activityId: bountyCall.activityId,
               difficulty: bountyCall.difficulty,
               awards,
-              energyCost: active.run.level.energyCost,
+              energyCost: settlement.energyCost,
               dailyBonusApplied: active.run.dailyBonusApplied,
             });
           } catch (error) {
@@ -2307,6 +2465,11 @@ export function createGatewayServer({
             if (vigour) {
               send(COMMAND.MONEY_UPDATE_NTF, 0, makeMoneyUpdateNotification(vigour));
             }
+            send(
+              COMMAND.TASK_VALUE_RSP,
+              0,
+              makeTaskValueSync(context.player.taskValues),
+            );
             send(
               COMMAND.NTF_S2C_CALL,
               0,
@@ -2610,6 +2773,15 @@ export function createGatewayServer({
               ...girlAppearanceCall,
             });
           } else if (isHeadTouchedCall(call)) {
+            context.player = await players.recordDailyMissionProgress(
+              context.account,
+              105,
+            );
+            send(
+              COMMAND.TASK_VALUE_RSP,
+              0,
+              makeTaskValueSync(context.player.taskValues),
+            );
             send(
               COMMAND.NTF_S2C_CALL,
               0,

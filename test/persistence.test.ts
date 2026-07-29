@@ -3,6 +3,12 @@ import os from "node:os";
 import path from "node:path";
 import { expect, it } from "vitest";
 
+import {
+  makeDailyMissionTaskId,
+  DAILY_MISSIONS,
+  DAILY_MISSION_ACTIVE_AWARD_TASK_ID,
+  DAILY_MISSION_ACTIVE_POINT_TASK_ID,
+} from "../src/game-data/daily-mission-data.js";
 import type { Logger } from "../src/logger.js";
 import { JsonStore } from "../src/persistence/json-store.js";
 import {
@@ -63,6 +69,13 @@ it("persists player and task changes atomically", async () => {
       "1507330": 256,
       "1507331": 256,
       "1507332": 256,
+      ...Object.fromEntries(
+        [
+          ...DAILY_MISSIONS.map(({ id }) => id),
+          DAILY_MISSION_ACTIVE_POINT_TASK_ID,
+          DAILY_MISSION_ACTIVE_AWARD_TASK_ID,
+        ].map((id) => [String(makeDailyMissionTaskId(id)), 0]),
+      ),
     });
     expect(
       player.inventory

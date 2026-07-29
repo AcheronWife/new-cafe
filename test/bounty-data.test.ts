@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   bountyOperationalDate,
+  effectiveBountyEnergyCost,
   getBountyLevel,
   isBountyOpen,
   makeBountyDailyTaskId,
@@ -47,6 +48,12 @@ describe("bounty battle configuration", () => {
     expect(first.maximumGold).toBe(18_000);
     expect(exhausted.maximumGold).toBe(8_000);
     expect(exhausted.dailyBonusApplied).toBe(false);
+  });
+
+  it("halves all bounty energy costs before manager level 35", () => {
+    expect(effectiveBountyEnergyCost(getBountyLevel(1, 1)!, 34)).toBe(5);
+    expect(effectiveBountyEnergyCost(getBountyLevel(1, 2)!, 34)).toBe(8);
+    expect(effectiveBountyEnergyCost(getBountyLevel(1, 2)!, 35)).toBe(15);
   });
 
   it("uses the client task IDs and the 04:00 Shanghai reset boundary", () => {

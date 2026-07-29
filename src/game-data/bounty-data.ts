@@ -200,6 +200,13 @@ export function getBountyLevel(
   return LEVELS.get(`${activityId}:${difficulty}`) ?? null;
 }
 
+export function effectiveBountyEnergyCost(
+  level: BountyLevelConfig,
+  playerLevel: number,
+): number {
+  return playerLevel < 35 ? Math.ceil(level.energyCost / 2) : level.energyCost;
+}
+
 export function makeBountyPassTaskId(activityId: number): number {
   return (BOUNTY_TASK_GROUP << 16) | (100 + activityId);
 }

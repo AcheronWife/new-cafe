@@ -9,6 +9,7 @@ import {
 import {
   BOUNTY_DAILY_REWARD_COUNT,
   bountyOperationalDate,
+  effectiveBountyEnergyCost,
   makeBountyDailyTaskId,
   makeBountyPassTaskId,
   type BountyEventType,
@@ -52,6 +53,26 @@ import {
   DAILY_SIGN_UP_TODAY_TASK,
   DAILY_SIGN_UP_TOTAL_TASK,
 } from "../game-data/daily-sign-up-data.js";
+import {
+  activeAwardsWithoutBattlePass,
+  claimableDailyMissionActiveAwards,
+  dailyMission,
+  dailyMissionActiveAward,
+  dailyMissionActivePoints,
+  dailyMissionProgress,
+  hasClaimedDailyMission,
+  hasClaimedDailyMissionActiveAward,
+  incrementDailyMissionProgress,
+  isDailyMissionTaskValueId,
+  makeDailyMissionTaskId,
+  makeDailyMissionTaskValue,
+  markDailyMissionActiveAwardClaimed,
+  reconcileDailyMissions,
+  DAILY_MISSIONS,
+  DAILY_MISSION_ACTIVE_POINT_MAX,
+  DAILY_MISSION_ACTIVE_POINT_TASK_ID,
+  type DailyMissionState,
+} from "../game-data/daily-mission-data.js";
 import {
   EIGHT_DAY_SIGN_UP_REWARDS,
   eightDaySignUpProgress,
@@ -248,6 +269,7 @@ export interface Player {
   cafe: CafeState;
   phone: PhoneState;
   gacha: GachaState;
+  dailyMissions?: DailyMissionState;
   dailySignUp: DailySignUpState;
   eightDaySignUp: EightDaySignUpState;
   bounty?: BountyState;
@@ -275,6 +297,7 @@ export interface ChapterSettlement {
 
 export interface BountySettlement {
   player: Player;
+  energyCost: number;
   updatedItems: InventoryItemState[];
   updatedMoney: MoneyState[];
   updatedGirls: GirlState[];
@@ -403,6 +426,31 @@ export interface GuideAwardResult {
   updatedItems: InventoryItemState[];
   updatedMoney: MoneyState[];
   updatedGirls: GirlState[];
+}
+
+export interface DailyMissionClaimResult {
+  player: Player;
+  claimedMissionIds: number[];
+  claimedActiveAwardIds: number[];
+  activeAwardItems: BaseAward[];
+  updatedItems: InventoryItemState[];
+  updatedMoney: MoneyState[];
+  updatedGirls: GirlState[];
+}
+
+export class DailyMissionError extends Error {
+  constructor(
+    readonly reason:
+      | "unknown_mission"
+      | "unknown_active_award"
+      | "not_completed"
+      | "already_claimed"
+      | "insufficient_active_points"
+      | "nothing_to_claim",
+  ) {
+    super(`Daily mission error: ${reason}`);
+    this.name = "DailyMissionError";
+  }
 }
 
 export class InsufficientVigourError extends Error {
@@ -1073,6 +1121,7 @@ export class PlayerRepository {
       player = state.players[safeAccount];
       if (player) {
         reconcileInventoryLockState(player);
+        reconcileDailyMissions(player);
         reconcileDailySignUp(player);
         reconcileEightDaySignUp(player);
         reconcileBounty(player);
@@ -1116,6 +1165,7 @@ export class PlayerRepository {
         ...makeStarterRoster(registerTime),
       };
       reconcileInventoryLockState(player);
+      reconcileDailyMissions(player);
       reconcileGirlAppearanceState(player);
       reconcileBounty(player);
       reconcileChapterStarTaskValues(player);
@@ -1138,6 +1188,7 @@ export class PlayerRepository {
       player = state.players[account];
       if (!player) throw new Error(`Unknown player account: ${account}`);
       reconcileInventoryLockState(player);
+      reconcileDailyMissions(player, now);
       reconcileDailySignUp(player, now);
       reconcileEightDaySignUp(player, now, true);
       reconcileBounty(player, now);
@@ -1300,6 +1351,7 @@ export class PlayerRepository {
           makeGirlTaskId(GIRL_STATE_TASK_GROUP, girlId, GIRL_TRAIN_OUTDOOR_ID_OFFSET),
         )
       ] = DEFAULT_TRAINING_OUTDOOR_ID;
+      incrementDailyMissionProgress(player, 106, 1, now);
     });
     if (!player) throw new Error(`Failed to start girl training: ${account}`);
     this.#logger.info("player.girl_training.started", {
@@ -1331,12 +1383,189 @@ export class PlayerRepository {
       player = state.players[account];
       if (!player) throw new Error(`Unknown player account: ${account}`);
       for (const { id, value } of changes) {
+        if (isDailyMissionTaskValueId(id)) continue;
         player.taskValues[String(id)] = value;
       }
     });
     this.#logger.info("player.tasks.updated", { account, changes });
     if (!player) throw new Error(`Failed to update player tasks: ${account}`);
     return structuredClone(player);
+  }
+
+  async recordDailyMissionProgress(
+    account: string,
+    missionId: number,
+    amount = 1,
+    now = Date.now(),
+  ): Promise<Player> {
+    if (!dailyMission(missionId)) {
+      throw new DailyMissionError("unknown_mission");
+    }
+
+    let player: Player | undefined;
+    let changed = false;
+    await this.#store.update((state) => {
+      player = state.players[account];
+      if (!player) throw new Error(`Unknown player account: ${account}`);
+      changed = incrementDailyMissionProgress(player, missionId, amount, now);
+    });
+    if (!player) {
+      throw new Error(`Failed to record daily mission progress: ${account}`);
+    }
+    if (changed) {
+      this.#logger.info("player.daily_mission.progressed", {
+        account,
+        missionId,
+        amount,
+        progress: dailyMissionProgress(
+          player.taskValues[String(makeDailyMissionTaskId(missionId))] ?? 0,
+        ),
+      });
+    }
+    return structuredClone(player);
+  }
+
+  async claimDailyMissionAwards(
+    account: string,
+    missionId: number,
+    claimAll = false,
+    now = Date.now(),
+  ): Promise<DailyMissionClaimResult> {
+    if (!claimAll && !dailyMission(missionId)) {
+      throw new DailyMissionError("unknown_mission");
+    }
+
+    let player: Player | undefined;
+    const claimedMissionIds: number[] = [];
+    const claimedActiveAwardIds: number[] = [];
+    const activeAwardItems: BaseAward[] = [];
+    const updatedItemGuids = new Set<number>();
+    const updatedMoneyIds = new Set<number>();
+    const updatedGirlIds = new Set<number>();
+    await this.#store.update((state) => {
+      player = state.players[account];
+      if (!player) throw new Error(`Unknown player account: ${account}`);
+      reconcileDailyMissions(player, now);
+
+      const missions = claimAll ? DAILY_MISSIONS : [dailyMission(missionId)!];
+      const activePointTaskId = String(
+        makeDailyMissionTaskId(DAILY_MISSION_ACTIVE_POINT_TASK_ID),
+      );
+      let activePoints = dailyMissionActivePoints(player);
+      for (const mission of missions) {
+        const taskId = String(makeDailyMissionTaskId(mission.id));
+        const taskValue = player.taskValues[taskId] ?? 0;
+        if (hasClaimedDailyMission(taskValue)) {
+          if (!claimAll) throw new DailyMissionError("already_claimed");
+          continue;
+        }
+        if (dailyMissionProgress(taskValue) < mission.target) {
+          if (!claimAll) throw new DailyMissionError("not_completed");
+          continue;
+        }
+
+        player.taskValues[taskId] = makeDailyMissionTaskValue(
+          dailyMissionProgress(taskValue),
+          true,
+        );
+        activePoints = Math.min(
+          DAILY_MISSION_ACTIVE_POINT_MAX,
+          activePoints + mission.activePoints,
+        );
+        player.taskValues[activePointTaskId] = activePoints;
+        claimedMissionIds.push(mission.id);
+      }
+
+      if (claimAll) {
+        for (const award of claimableDailyMissionActiveAwards(player)) {
+          markDailyMissionActiveAwardClaimed(player, award.id);
+          claimedActiveAwardIds.push(award.id);
+          activeAwardItems.push(...activeAwardsWithoutBattlePass(award.awards));
+        }
+        if (activeAwardItems.length > 0) {
+          grantAwards(player, activeAwardItems, updatedItemGuids, updatedMoneyIds);
+        }
+      }
+
+      if (claimedMissionIds.length === 0 && claimedActiveAwardIds.length === 0) {
+        throw new DailyMissionError("nothing_to_claim");
+      }
+
+      const girlReconciliation = reconcileGirlAppearanceState(player, updatedItemGuids);
+      for (const girlId of girlReconciliation.updatedGirlIds) {
+        updatedGirlIds.add(girlId);
+      }
+    });
+    if (!player) throw new Error(`Failed to claim daily missions: ${account}`);
+
+    const snapshot = structuredClone(player);
+    this.#logger.info("player.daily_mission.claimed", {
+      account,
+      claimedMissionIds,
+      claimedActiveAwardIds,
+      activeAwardItems,
+    });
+    return {
+      player: snapshot,
+      claimedMissionIds,
+      claimedActiveAwardIds,
+      activeAwardItems,
+      updatedItems: snapshot.inventory.filter(({ guid }) => updatedItemGuids.has(guid)),
+      updatedMoney: snapshot.money.filter(({ id }) => updatedMoneyIds.has(id)),
+      updatedGirls: snapshot.girls.filter(({ girlId }) => updatedGirlIds.has(girlId)),
+    };
+  }
+
+  async claimDailyMissionActiveAward(
+    account: string,
+    awardId: number,
+    now = Date.now(),
+  ): Promise<DailyMissionClaimResult> {
+    const award = dailyMissionActiveAward(awardId);
+    if (!award) throw new DailyMissionError("unknown_active_award");
+
+    let player: Player | undefined;
+    const activeAwardItems = activeAwardsWithoutBattlePass(award.awards);
+    const updatedItemGuids = new Set<number>();
+    const updatedMoneyIds = new Set<number>();
+    const updatedGirlIds = new Set<number>();
+    await this.#store.update((state) => {
+      player = state.players[account];
+      if (!player) throw new Error(`Unknown player account: ${account}`);
+      reconcileDailyMissions(player, now);
+      if (hasClaimedDailyMissionActiveAward(player, award.id)) {
+        throw new DailyMissionError("already_claimed");
+      }
+      if (dailyMissionActivePoints(player) < award.requiredPoints) {
+        throw new DailyMissionError("insufficient_active_points");
+      }
+
+      markDailyMissionActiveAwardClaimed(player, award.id);
+      grantAwards(player, activeAwardItems, updatedItemGuids, updatedMoneyIds);
+      const girlReconciliation = reconcileGirlAppearanceState(player, updatedItemGuids);
+      for (const girlId of girlReconciliation.updatedGirlIds) {
+        updatedGirlIds.add(girlId);
+      }
+    });
+    if (!player) {
+      throw new Error(`Failed to claim daily mission active award: ${account}`);
+    }
+
+    const snapshot = structuredClone(player);
+    this.#logger.info("player.daily_mission.active_award_claimed", {
+      account,
+      awardId,
+      activeAwardItems,
+    });
+    return {
+      player: snapshot,
+      claimedMissionIds: [],
+      claimedActiveAwardIds: [award.id],
+      activeAwardItems,
+      updatedItems: snapshot.inventory.filter(({ guid }) => updatedItemGuids.has(guid)),
+      updatedMoney: snapshot.money.filter(({ id }) => updatedMoneyIds.has(id)),
+      updatedGirls: snapshot.girls.filter(({ girlId }) => updatedGirlIds.has(girlId)),
+    };
   }
 
   async signUpDaily(account: string, now = Date.now()): Promise<DailySignUpResult> {
@@ -1763,6 +1992,7 @@ export class PlayerRepository {
       } else {
         player.cafe.coffees.push({ coffeetype: coffeeType, count });
       }
+      incrementDailyMissionProgress(player, 110);
     });
     this.#logger.info("player.cafe.coffee_made", {
       account,
@@ -2078,6 +2308,7 @@ export class PlayerRepository {
           { type: "fight_power.changed", value: player.fightPower },
         ]);
       }
+      incrementDailyMissionProgress(player, 107);
     });
     if (!player || !enhancedCard) {
       throw new Error(`Failed to enhance character card: ${guid}`);
@@ -2227,6 +2458,7 @@ export class PlayerRepository {
         events.push({ type: "fight_power.changed", value: player.fightPower });
       }
       this.#activities.dispatch(player, events);
+      incrementDailyMissionProgress(player, 107);
     });
     if (!player || !enhancedWeapon) {
       throw new Error(`Failed to enhance weapon: ${guid}`);
@@ -2441,6 +2673,7 @@ export class PlayerRepository {
       } else {
         player.money.push({ id: MONEY_VIGOUR, count: -energyCost });
       }
+      incrementDailyMissionProgress(player, 109, energyCost);
     });
     this.#logger.info("player.level.entered", { account, energyCost });
     if (!player) throw new Error(`Failed to enter level: ${account}`);
@@ -2456,6 +2689,7 @@ export class PlayerRepository {
   ): Promise<BountySettlement> {
     let player: Player | undefined;
     let experienceUpdate: PlayerExperienceUpdate | undefined;
+    let energyCost = 0;
     const updatedItemGuids = new Set<number>();
     const updatedMoneyIds = new Set<number>();
     const updatedGirlIds = new Set<number>();
@@ -2464,16 +2698,17 @@ export class PlayerRepository {
       if (!player) throw new Error(`Unknown player account: ${account}`);
       reconcileBounty(player);
 
+      energyCost = effectiveBountyEnergyCost(level, player.level);
       let vigour = player.money.find(({ id }) => id === MONEY_VIGOUR);
       const available = vigour?.count ?? 0;
-      if (available < level.energyCost) {
-        throw new InsufficientVigourError(level.energyCost, available);
+      if (available < energyCost) {
+        throw new InsufficientVigourError(energyCost, available);
       }
       if (!vigour) {
         vigour = { id: MONEY_VIGOUR, count: 0 };
         player.money.push(vigour);
       }
-      vigour.count -= level.energyCost;
+      vigour.count -= energyCost;
       updatedMoneyIds.add(MONEY_VIGOUR);
 
       if (keyItem) {
@@ -2519,6 +2754,9 @@ export class PlayerRepository {
       const completionKey = `${level.activityId}:${level.difficulty}`;
       player.bounty!.completionCounts[completionKey] =
         (player.bounty!.completionCounts[completionKey] ?? 0) + 1;
+      incrementDailyMissionProgress(player, 101);
+      incrementDailyMissionProgress(player, 103);
+      incrementDailyMissionProgress(player, 109, energyCost);
 
       experienceUpdate = applyPlayerExperience(player, level.masterExp);
       if (experienceUpdate.vigourRecovery > 0) {
@@ -2537,7 +2775,7 @@ export class PlayerRepository {
       account,
       activityId: level.activityId,
       difficulty: level.difficulty,
-      energyCost: level.energyCost,
+      energyCost,
       dailyBonusApplied,
       awards,
       masterExp: level.masterExp,
@@ -2545,6 +2783,7 @@ export class PlayerRepository {
     const snapshot = structuredClone(player);
     return {
       player: snapshot,
+      energyCost,
       updatedItems: snapshot.inventory.filter(({ guid }) => updatedItemGuids.has(guid)),
       updatedMoney: snapshot.money.filter(({ id }) => updatedMoneyIds.has(id)),
       updatedGirls: snapshot.girls.filter(({ girlId }) => updatedGirlIds.has(girlId)),
@@ -2600,6 +2839,7 @@ export class PlayerRepository {
             firstClear,
           },
         ]);
+        incrementDailyMissionProgress(player, 101);
       }
       if (
         chapter === 1 &&
