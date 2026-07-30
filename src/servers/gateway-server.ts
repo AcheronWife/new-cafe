@@ -313,6 +313,20 @@ interface ChapterCall {
   parameters: Record<string, unknown>;
 }
 
+export function chapterSettlementMatchesActiveLevel(
+  activeLevel: Pick<ChapterLevelConfig, "chapter" | "index" | "difficulty"> | null,
+  chapter: number,
+  index: number,
+  difficulty: number,
+): boolean {
+  return (
+    activeLevel !== null &&
+    activeLevel.chapter === chapter &&
+    activeLevel.index === index &&
+    activeLevel.difficulty === difficulty
+  );
+}
+
 function parseChapterCall(call: LuaCall | null): ChapterCall | null {
   if (!call || typeof call.parameters !== "object" || call.parameters === null) {
     return null;
@@ -2506,26 +2520,42 @@ export function createGatewayServer({
               return;
             }
 
+            const activeChapter = context.activeChapter;
+            if (
+              !activeChapter ||
+              !chapterSettlementMatchesActiveLevel(
+                activeChapter.level,
+                chapter,
+                index,
+                difficulty,
+              )
+            ) {
+              logger.warn("chapter.settlement.stale", {
+                account: context.account,
+                chapter,
+                index,
+                difficulty,
+                star,
+                activeChapter: context.activeChapter
+                  ? {
+                      chapter: context.activeChapter.level.chapter,
+                      index: context.activeChapter.level.index,
+                      difficulty: context.activeChapter.level.difficulty,
+                    }
+                  : null,
+              });
+              return;
+            }
+
             let completedStar = star;
             let awards: ReturnType<typeof rollChapterAwards> = [];
             let masterExp = 0;
             let cardExp = 0;
             if (star > 0) {
-              const level =
-                context.activeChapter?.level ??
-                chapterCatalog.get(chapter, index, difficulty);
-              if (!level) {
-                throw new Error(
-                  `Missing chapter config ${chapter}:${index}:${difficulty}`,
-                );
-              }
-              const currentPlayer =
-                context.player ?? (await players.getOrCreate(context.account));
+              const level = activeChapter.level;
               const levelId = makeLevelId(chapter, index, difficulty);
-              const previous = currentPlayer.levels.find(({ id }) => id === levelId);
-              const passCount =
-                context.activeChapter?.passCount ?? (previous?.star ?? 0) >>> 3;
-              const firstClear = context.activeChapter?.firstClear ?? passCount === 0;
+              const passCount = activeChapter.passCount;
+              const firstClear = activeChapter.firstClear;
               awards = rollChapterAwards(
                 level,
                 firstClear,
@@ -2585,6 +2615,7 @@ export function createGatewayServer({
               },
             };
             context.lastSettlement = { key: settlementKey, response };
+            context.activeChapter = null;
             send(COMMAND.NTF_S2C_CALL, 0, makeServerLuaCall("ChapterMsg", response));
             logger.info("lua.callback", {
               peer,
@@ -2594,7 +2625,7 @@ export function createGatewayServer({
               chapter,
               index,
               difficulty,
-              firstClear: context.activeChapter?.firstClear ?? false,
+              firstClear: activeChapter.firstClear,
               awards,
               masterExp,
               cardExp,
