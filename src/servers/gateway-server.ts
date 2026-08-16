@@ -266,6 +266,21 @@ function parseGirlLevelAwardCall(call: LuaCall | null): GirlLevelAwardCall | nul
     : null;
 }
 
+function parseGirlEndTrainCall(call: LuaCall | null): { girlId: number } | null {
+  if (
+    call?.method !== "GirlLogic" ||
+    typeof call.parameters !== "object" ||
+    call.parameters === null
+  ) {
+    return null;
+  }
+
+  const parameters = call.parameters as Record<string, unknown>;
+  if (parameters.sCmd !== "EndTrain") return null;
+  const girlId = Number(parameters.nId);
+  return Number.isSafeInteger(girlId) && girlId > 0 ? { girlId } : null;
+}
+
 function parseGirlTrainingCall(call: LuaCall | null): GirlTrainingCall | null {
   if (
     call?.method !== "GirlLogic" ||
@@ -760,6 +775,7 @@ export function createGatewayServer({
         const girlAppearanceCall = parseGirlAppearanceCall(call);
         const girlGiftCall = parseGirlGiftCall(call);
         const girlLevelAwardCall = parseGirlLevelAwardCall(call);
+        const girlEndTrainCall = parseGirlEndTrainCall(call);
         logger.info("lua.call", {
           peer,
           account: context.account,
@@ -2982,6 +2998,68 @@ export function createGatewayServer({
                 account: context.account,
                 ...girlLevelAwardCall,
                 reason: error.reason,
+              });
+            }
+          } else if (girlEndTrainCall) {
+            try {
+              const result = await players.endGirlTraining(
+                context.account,
+                girlEndTrainCall.girlId,
+              );
+              context.player = result.player;
+              send(COMMAND.GIRL_UPDATE_NTF, 0, makeGirlUpdateNotification(result.girl));
+              for (const money of result.updatedMoney) {
+                send(COMMAND.MONEY_UPDATE_NTF, 0, makeMoneyUpdateNotification(money));
+              }
+              send(
+                COMMAND.TASK_VALUE_RSP,
+                0,
+                makeTaskValueSync(result.player.taskValues),
+              );
+              send(
+                COMMAND.NTF_S2C_CALL,
+                0,
+                makeServerLuaCall("GirlLogic", {
+                  sCmd: "EndTrain",
+                  nId: result.girlId,
+                  nMoney: [15, 1, 1, 1, result.gold],
+                  AddExpInfo: [
+                    result.addedExperience,
+                    result.oldExperience,
+                    result.newExperience,
+                    result.oldLevel,
+                    result.newLevel,
+                  ],
+                }),
+              );
+              logger.info("girl.training.ended", {
+                peer,
+                account: context.account,
+                girlId: result.girlId,
+                position: result.position,
+                gold: result.gold,
+                addedExperience: result.addedExperience,
+                oldLevel: result.oldLevel,
+                newLevel: result.newLevel,
+                unlockedSecretIds: result.unlockedSecretIds,
+              });
+            } catch (error) {
+              if (!(error instanceof GirlTrainingError)) throw error;
+              send(
+                COMMAND.NTF_S2C_CALL,
+                0,
+                makeServerLuaCall("GirlLogic", {
+                  sCmd: "EndTrain",
+                  nId: girlEndTrainCall.girlId,
+                  nError: error.clientError,
+                }),
+              );
+              logger.warn("girl.training.end_rejected", {
+                peer,
+                account: context.account,
+                ...girlEndTrainCall,
+                reason: error.reason,
+                clientError: error.clientError,
               });
             }
           } else if (isHeadTouchedCall(call)) {

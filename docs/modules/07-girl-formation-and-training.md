@@ -63,9 +63,26 @@
 - 将位置、结束时间、户外区域写入少女任务值；
 - 同一少女重复提交相同位置时幂等返回。
 
+支持 `GirlLogic EndTrain {nId}` 的结算：
+
+- 校验少女在训且到达结束时间（`now >= TrainTime`，客户端也只在此刻放行）；
+- 按 `TrainingGirl.txt` 发放好感经验（60/120/240/480，走与送礼相同的
+  `GirlCommon:Add` 升级曲线，满级少女加 0 并原样回调）和金币
+  （`15-1-1-1-N` → 1000/1800/3200/5000）；
+- 升级跨过 FitLove 阈值时解锁对应 Secret 任务位（与送礼共用）；
+- 清空位置、结束时间和户外区域任务位；
+- 依次发送 `GIRL_UPDATE_NTF`、`MONEY_UPDATE_NTF`、`TASK_VALUE_RSP`，回调
+  `{sCmd:'EndTrain', nId, nMoney:[15,1,1,1,N], AddExpInfo:[add,oldExp,newExp,oldLevel,newLevel]}`，
+  与客户端 `OnEndTrain` 的读取一致（含一键特训的多次调用）。
+
+`InterruptTrain`（打断特训）和调试用的 `TestEndTrain` 尚未实现，日志出现时
+再补。
+
 ## 验证
 
 - `test/girl-training-data.test.ts` 覆盖训练配置和非法位置；
+- `test/girl-training-end-persistence.test.ts` 覆盖特训结算、升级秘密解锁、
+  满级零收益和未在训/未完成的拒绝路径；
 - `test/girl-gift-data.test.ts` 覆盖礼物经验、好感曲线、升级截断和
   手作活动窗口；
 - `test/girl-gift-persistence.test.ts` 覆盖送礼扣减、喜爱加成、秘密解锁、
@@ -75,8 +92,7 @@
 
 ## 已知缺口
 
-- `EndTrain` 尚未实现，运行日志中仍能观察到未处理请求；
-- 不发放特训好感与晶石奖励，也不清理训练占位；
+- `InterruptTrain` / `TestEndTrain` 尚未实现，运行日志中可能出现未处理请求；
 - 指引任务“安排四种不同特训”没有接入事件；
 - 好感升级的配套系统（羁绊剧情 `CalPlotByLevel`、升级触发的私信事件
   `PhoneEventCheck(3)`、成就 `OnAddFriendLevel`）未接入；

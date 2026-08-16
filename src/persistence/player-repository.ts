@@ -347,6 +347,21 @@ export interface GirlTrainingResult {
   outdoorId: number;
 }
 
+export interface GirlTrainingEndResult {
+  player: Player;
+  girl: GirlState;
+  girlId: number;
+  position: number;
+  gold: number;
+  updatedMoney: MoneyState[];
+  addedExperience: number;
+  oldExperience: number;
+  newExperience: number;
+  oldLevel: number;
+  newLevel: number;
+  unlockedSecretIds: number[];
+}
+
 export class GirlTrainingError extends Error {
   constructor(
     readonly reason:
@@ -354,7 +369,9 @@ export class GirlTrainingError extends Error {
       | "invalid_position"
       | "girl_already_training"
       | "position_occupied"
-      | "training_limit",
+      | "training_limit"
+      | "not_training"
+      | "training_not_finished",
     readonly clientError: 5 | 6 = 5,
   ) {
     super(`Girl training error: ${reason}`);
@@ -692,6 +709,32 @@ function makeGirlTaskId(group: number, girlId: number, offset: number): number {
     taskGirlId -= LINK_GIRL_ID;
   }
   return (taskGroup << 16) | ((taskGirlId - 1) * GIRL_TASK_STRIDE + offset);
+}
+
+/**
+ * Unlocks the Secret.txt FitLove secrets crossed by an affection level-up
+ * (girls 1-16 only; link girls have no level-gated secrets). Returns the
+ * newly unlocked secret ids.
+ */
+function unlockGirlLevelSecrets(
+  player: Player,
+  girlId: number,
+  oldLevel: number,
+  newLevel: number,
+): number[] {
+  const unlocked: number[] = [];
+  if (girlId < 1 || girlId > 16) return unlocked;
+  for (const { secretId, level } of FIT_LOVE_SECRET_LEVELS) {
+    if (level <= oldLevel || level > newLevel) continue;
+    const key = String(
+      makeGirlTaskId(GIRL_STATE_TASK_GROUP, girlId, GIRL_SECRET_OFFSET + secretId - 1),
+    );
+    if ((player.taskValues[key] ?? 0) === 0) {
+      player.taskValues[key] = 1;
+      unlocked.push(secretId);
+    }
+  }
+  return unlocked;
 }
 
 function fixGirlModelTaskOffset(modelId: number): number {
@@ -1481,26 +1524,9 @@ export class PlayerRepository {
       girl.exp = gain.newExperience;
 
       const taskValues = player.taskValues;
-      const unlockSecret = (secretId: number) => {
-        const key = String(
-          makeGirlTaskId(
-            GIRL_STATE_TASK_GROUP,
-            girlId,
-            GIRL_SECRET_OFFSET + secretId - 1,
-          ),
-        );
-        if ((taskValues[key] ?? 0) === 0) {
-          taskValues[key] = 1;
-          unlockedSecretIds.push(secretId);
-        }
-      };
-      if (girlId >= 1 && girlId <= 16) {
-        for (const { secretId, level } of FIT_LOVE_SECRET_LEVELS) {
-          if (level > gain.oldLevel && level <= gain.newLevel) {
-            unlockSecret(secretId);
-          }
-        }
-      }
+      unlockedSecretIds.push(
+        ...unlockGirlLevelSecrets(player, girlId, gain.oldLevel, gain.newLevel),
+      );
       for (const { secretId, gdpl } of favoriteGiftSecretIds(girlId)) {
         if (
           gdpl[0] === item[0] &&
@@ -1508,7 +1534,17 @@ export class PlayerRepository {
           gdpl[2] === item[2] &&
           gdpl[3] === item[3]
         ) {
-          unlockSecret(secretId);
+          const key = String(
+            makeGirlTaskId(
+              GIRL_STATE_TASK_GROUP,
+              girlId,
+              GIRL_SECRET_OFFSET + secretId - 1,
+            ),
+          );
+          if ((taskValues[key] ?? 0) === 0) {
+            taskValues[key] = 1;
+            unlockedSecretIds.push(secretId);
+          }
         }
       }
     });
@@ -1592,6 +1628,94 @@ export class PlayerRepository {
       throw new Error(`Failed to claim girl level award: ${account}`);
     }
     return structuredClone(player);
+  }
+
+  async endGirlTraining(
+    account: string,
+    girlId: number,
+    now = Date.now(),
+  ): Promise<GirlTrainingEndResult> {
+    let player: Player | undefined;
+    let position = 0;
+    let goldReward = 0;
+    let gain: GirlAffectionGain | null | undefined;
+    const unlockedSecretIds: number[] = [];
+    await this.#store.update((state) => {
+      player = state.players[account];
+      if (!player) throw new Error(`Unknown player account: ${account}`);
+      const girl = player.girls.find((candidate) => candidate.girlId === girlId);
+      if (!girl) throw new GirlTrainingError("girl_not_owned");
+
+      const positionKey = String(
+        makeGirlTaskId(GIRL_STATE_TASK_GROUP, girlId, GIRL_TRAIN_POSITION_OFFSET),
+      );
+      const endTimeKey = String(
+        makeGirlTaskId(GIRL_STATE_TASK_GROUP, girlId, GIRL_TRAIN_END_TIME_OFFSET),
+      );
+      position = player.taskValues[positionKey] ?? 0;
+      if (position <= 0) throw new GirlTrainingError("not_training");
+      const endTime = player.taskValues[endTimeKey] ?? 0;
+      if (endTime > 0 && Math.floor(now / 1_000) < endTime) {
+        throw new GirlTrainingError("training_not_finished");
+      }
+      const config = getGirlTrainingConfig(position);
+      if (!config) throw new GirlTrainingError("invalid_position");
+
+      gain = addGirlAffection(girlId, girl.level, girl.exp, config.loveReward);
+      if (gain) {
+        girl.level = gain.newLevel;
+        girl.exp = gain.newExperience;
+        unlockedSecretIds.push(
+          ...unlockGirlLevelSecrets(player, girlId, gain.oldLevel, gain.newLevel),
+        );
+      }
+
+      goldReward = config.crystalReward;
+      let gold = player.money.find(({ id }) => id === MONEY_GOLD);
+      if (!gold) {
+        gold = { id: MONEY_GOLD, count: 0 };
+        player.money.push(gold);
+      }
+      gold.count += goldReward;
+
+      player.taskValues[positionKey] = 0;
+      player.taskValues[endTimeKey] = 0;
+      player.taskValues[
+        String(
+          makeGirlTaskId(GIRL_STATE_TASK_GROUP, girlId, GIRL_TRAIN_OUTDOOR_ID_OFFSET),
+        )
+      ] = 0;
+    });
+    if (!player || gain === undefined) {
+      throw new Error(`Failed to end girl training: ${account}`);
+    }
+    this.#logger.info("player.girl_training.ended", {
+      account,
+      girlId,
+      position,
+      gold: goldReward,
+      addedExperience: gain?.addedExperience ?? 0,
+      oldLevel: gain?.oldLevel,
+      newLevel: gain?.newLevel,
+      unlockedSecretIds,
+    });
+    const snapshot = structuredClone(player);
+    const girl = snapshot.girls.find((candidate) => candidate.girlId === girlId);
+    if (!girl) throw new Error(`Trained girl disappeared: ${account}`);
+    return {
+      player: snapshot,
+      girl,
+      girlId,
+      position,
+      gold: goldReward,
+      updatedMoney: snapshot.money.filter(({ id }) => id === MONEY_GOLD),
+      addedExperience: gain?.addedExperience ?? 0,
+      oldExperience: gain?.oldExperience ?? girl.exp,
+      newExperience: gain?.newExperience ?? girl.exp,
+      oldLevel: gain?.oldLevel ?? girl.level,
+      newLevel: gain?.newLevel ?? girl.level,
+      unlockedSecretIds,
+    };
   }
 
   async setTaskValues(
