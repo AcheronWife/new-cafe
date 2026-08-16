@@ -101,6 +101,16 @@ import {
 } from "../game-data/guide-mission-data.js";
 import { maximumFormationPower } from "../game-data/formation-power-data.js";
 import {
+  addGirlAffection,
+  favoriteGiftSecretIds,
+  FIT_LOVE_SECRET_LEVELS,
+  girlGiftExperience,
+  girlLevelAwardIndex,
+  handworkGiftState,
+  isFavoriteGift,
+  type GirlAffectionGain,
+} from "../game-data/girl-gift-data.js";
+import {
   DEFAULT_TRAINING_OUTDOOR_ID,
   getGirlTrainingConfig,
   MAX_CONCURRENT_GIRL_TRAINING,
@@ -129,6 +139,8 @@ const GIRL_FIGHT_MODEL_OFFSET = 9;
 const GIRL_TRAIN_POSITION_OFFSET = 11;
 const GIRL_TRAIN_END_TIME_OFFSET = 12;
 const GIRL_TRAIN_OUTDOOR_ID_OFFSET = 16;
+const GIRL_SECRET_OFFSET = 100;
+const GIRL_LEVEL_AWARD_OFFSET = 500;
 const LINK_GIRL_ID = 200;
 const LINK_GIRL_MIN_ID = 201;
 const LINK_GIRL_MAX_ID = 204;
@@ -347,6 +359,53 @@ export class GirlTrainingError extends Error {
   ) {
     super(`Girl training error: ${reason}`);
     this.name = "GirlTrainingError";
+  }
+}
+
+export interface GirlGiftResult {
+  player: Player;
+  girl: GirlState;
+  consumedItem: InventoryItemState;
+  girlId: number;
+  item: Gdpl;
+  count: number;
+  loved: boolean;
+  activityGift: boolean;
+  specialActivityGift: boolean;
+  addedExperience: number;
+  oldExperience: number;
+  newExperience: number;
+  oldLevel: number;
+  newLevel: number;
+  reachedMaxLevel: boolean;
+  unlockedSecretIds: number[];
+}
+
+export class GirlGiftError extends Error {
+  constructor(
+    readonly reason:
+      | "invalid_request"
+      | "gift_not_found"
+      | "insufficient_gift"
+      | "girl_not_owned"
+      | "max_level",
+    readonly clientError: 1 | 2 | 3 | 4 = reason === "girl_not_owned"
+      ? 3
+      : reason === "max_level"
+        ? 4
+        : reason === "invalid_request"
+          ? 1
+          : 2,
+  ) {
+    super(`Girl gift error: ${reason}`);
+    this.name = "GirlGiftError";
+  }
+}
+
+export class GirlLevelAwardError extends Error {
+  constructor(readonly reason: "girl_not_owned" | "invalid_level") {
+    super(`Girl level award error: ${reason}`);
+    this.name = "GirlLevelAwardError";
   }
 }
 
@@ -1372,6 +1431,167 @@ export class PlayerRepository {
       endTime,
       outdoorId: DEFAULT_TRAINING_OUTDOOR_ID,
     };
+  }
+
+  async sendGirlGift(
+    account: string,
+    girlId: number,
+    item: Gdpl,
+    count: number,
+    now = Date.now(),
+  ): Promise<GirlGiftResult> {
+    if (!Number.isSafeInteger(count) || count <= 0) {
+      throw new GirlGiftError("invalid_request");
+    }
+    const perGiftExperience = girlGiftExperience(girlId, item);
+    if (perGiftExperience === null) throw new GirlGiftError("gift_not_found");
+    const handwork = handworkGiftState(item, now);
+
+    let player: Player | undefined;
+    let affection: GirlAffectionGain | undefined;
+    const unlockedSecretIds: number[] = [];
+    await this.#store.update((state) => {
+      player = state.players[account];
+      if (!player) throw new Error(`Unknown player account: ${account}`);
+      const girl = player.girls.find((candidate) => candidate.girlId === girlId);
+      if (!girl) throw new GirlGiftError("girl_not_owned");
+
+      const inventoryItem = player.inventory.find(
+        (candidate) =>
+          candidate.genre === item[0] &&
+          candidate.detail === item[1] &&
+          candidate.particular === item[2] &&
+          candidate.templateLevel === item[3],
+      );
+      if (!inventoryItem || inventoryItem.count < count) {
+        throw new GirlGiftError("insufficient_gift");
+      }
+
+      const gain = addGirlAffection(
+        girlId,
+        girl.level,
+        girl.exp,
+        perGiftExperience * count,
+      );
+      if (!gain) throw new GirlGiftError("max_level");
+      affection = gain;
+
+      inventoryItem.count -= count;
+      girl.level = gain.newLevel;
+      girl.exp = gain.newExperience;
+
+      const taskValues = player.taskValues;
+      const unlockSecret = (secretId: number) => {
+        const key = String(
+          makeGirlTaskId(
+            GIRL_STATE_TASK_GROUP,
+            girlId,
+            GIRL_SECRET_OFFSET + secretId - 1,
+          ),
+        );
+        if ((taskValues[key] ?? 0) === 0) {
+          taskValues[key] = 1;
+          unlockedSecretIds.push(secretId);
+        }
+      };
+      if (girlId >= 1 && girlId <= 16) {
+        for (const { secretId, level } of FIT_LOVE_SECRET_LEVELS) {
+          if (level > gain.oldLevel && level <= gain.newLevel) {
+            unlockSecret(secretId);
+          }
+        }
+      }
+      for (const { secretId, gdpl } of favoriteGiftSecretIds(girlId)) {
+        if (
+          gdpl[0] === item[0] &&
+          gdpl[1] === item[1] &&
+          gdpl[2] === item[2] &&
+          gdpl[3] === item[3]
+        ) {
+          unlockSecret(secretId);
+        }
+      }
+    });
+    if (!player || !affection) {
+      throw new Error(`Failed to send girl gift: ${account}`);
+    }
+    this.#logger.info("player.girl_gift.sent", {
+      account,
+      girlId,
+      item,
+      count,
+      addedExperience: affection.addedExperience,
+      oldLevel: affection.oldLevel,
+      newLevel: affection.newLevel,
+      unlockedSecretIds,
+    });
+    const snapshot = structuredClone(player);
+    const girl = snapshot.girls.find((candidate) => candidate.girlId === girlId);
+    const consumedItem = snapshot.inventory.find(
+      (candidate) =>
+        candidate.genre === item[0] &&
+        candidate.detail === item[1] &&
+        candidate.particular === item[2] &&
+        candidate.templateLevel === item[3],
+    );
+    if (!girl || !consumedItem) {
+      throw new Error(`Girl gift state disappeared: ${account}`);
+    }
+    return {
+      player: snapshot,
+      girl,
+      consumedItem,
+      girlId,
+      item,
+      count,
+      loved: isFavoriteGift(girlId, item),
+      activityGift: handwork.active,
+      specialActivityGift: handwork.special,
+      addedExperience: affection.addedExperience,
+      oldExperience: affection.oldExperience,
+      newExperience: affection.newExperience,
+      oldLevel: affection.oldLevel,
+      newLevel: affection.newLevel,
+      reachedMaxLevel: affection.reachedMaxLevel,
+      unlockedSecretIds,
+    };
+  }
+
+  async claimGirlLevelAward(
+    account: string,
+    girlId: number,
+    level: number,
+  ): Promise<Player> {
+    const index = girlLevelAwardIndex(level);
+    if (index === null) throw new GirlLevelAwardError("invalid_level");
+
+    let player: Player | undefined;
+    await this.#store.update((state) => {
+      player = state.players[account];
+      if (!player) throw new Error(`Unknown player account: ${account}`);
+      if (!player.girls.some((girl) => girl.girlId === girlId)) {
+        throw new GirlLevelAwardError("girl_not_owned");
+      }
+      player.taskValues[
+        String(
+          makeGirlTaskId(
+            GIRL_STATE_TASK_GROUP,
+            girlId,
+            GIRL_LEVEL_AWARD_OFFSET + index - 1,
+          ),
+        )
+      ] = 1;
+    });
+    this.#logger.info("player.girl_level_award.claimed", {
+      account,
+      girlId,
+      level,
+      index,
+    });
+    if (!player) {
+      throw new Error(`Failed to claim girl level award: ${account}`);
+    }
+    return structuredClone(player);
   }
 
   async setTaskValues(

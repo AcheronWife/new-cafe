@@ -53,7 +53,11 @@ import {
   makeGuideLogAcknowledgement,
 } from "../game-data/guide-data.js";
 import { EIGHT_DAY_SIGN_UP_ACTIVITY_ID } from "../game-data/eight-day-sign-up-data.js";
-import { GachaCatalog, type GachaRollResult } from "../game-data/gacha-data.js";
+import {
+  GachaCatalog,
+  type GachaRollResult,
+  type Gdpl,
+} from "../game-data/gacha-data.js";
 import {
   LUA_COMMAND_SHOP_GOODS_LIST,
   makeShopGoodsListResponse,
@@ -70,6 +74,8 @@ import {
   InsufficientGachaCurrencyError,
   EightDaySignUpError,
   GuideMissionError,
+  GirlGiftError,
+  GirlLevelAwardError,
   GirlTrainingError,
   ChapterStarAwardError,
   CharacterCardDecompositionError,
@@ -199,6 +205,65 @@ type GirlAppearanceCall =
 interface GirlTrainingCall {
   girlId: number;
   position: number;
+}
+
+interface GirlGiftCall {
+  girlId: number;
+  item: Gdpl;
+  count: number;
+}
+
+interface GirlLevelAwardCall {
+  girlId: number;
+  level: number;
+}
+
+function parseGirlGiftCall(call: LuaCall | null): GirlGiftCall | null {
+  if (
+    call?.method !== "GirlLogic" ||
+    typeof call.parameters !== "object" ||
+    call.parameters === null
+  ) {
+    return null;
+  }
+
+  const parameters = call.parameters as Record<string, unknown>;
+  if (parameters.sCmd !== "GirlGift") return null;
+  const girlId = Number(parameters.nId);
+  const rawItem = parameters.tbItem;
+  if (!Array.isArray(rawItem) || rawItem.length !== 4) return null;
+  const item = rawItem.map(Number);
+  if (
+    !item.every((value) => Number.isSafeInteger(value) && value > 0) ||
+    !Number.isSafeInteger(girlId) ||
+    girlId <= 0
+  ) {
+    return null;
+  }
+  const count = parameters.ItemNum === undefined ? 1 : Number(parameters.ItemNum);
+  if (!Number.isSafeInteger(count) || count <= 0) return null;
+  return { girlId, item: item as unknown as Gdpl, count };
+}
+
+function parseGirlLevelAwardCall(call: LuaCall | null): GirlLevelAwardCall | null {
+  if (
+    call?.method !== "GirlLogic" ||
+    typeof call.parameters !== "object" ||
+    call.parameters === null
+  ) {
+    return null;
+  }
+
+  const parameters = call.parameters as Record<string, unknown>;
+  if (parameters.sCmd !== "LevelAward") return null;
+  const girlId = Number(parameters.nId);
+  const level = Number(parameters.nLevel);
+  return Number.isSafeInteger(girlId) &&
+    girlId > 0 &&
+    Number.isSafeInteger(level) &&
+    level > 0
+    ? { girlId, level }
+    : null;
 }
 
 function parseGirlTrainingCall(call: LuaCall | null): GirlTrainingCall | null {
@@ -693,6 +758,8 @@ export function createGatewayServer({
         const luaCommand = parseNumericLuaCommand(call);
         const girlTrainingCall = parseGirlTrainingCall(call);
         const girlAppearanceCall = parseGirlAppearanceCall(call);
+        const girlGiftCall = parseGirlGiftCall(call);
+        const girlLevelAwardCall = parseGirlLevelAwardCall(call);
         logger.info("lua.call", {
           peer,
           account: context.account,
@@ -2803,6 +2870,120 @@ export function createGatewayServer({
               account: context.account,
               ...girlAppearanceCall,
             });
+          } else if (girlGiftCall) {
+            try {
+              const result = await players.sendGirlGift(
+                context.account,
+                girlGiftCall.girlId,
+                girlGiftCall.item,
+                girlGiftCall.count,
+              );
+              context.player = result.player;
+              send(COMMAND.GIRL_UPDATE_NTF, 0, makeGirlUpdateNotification(result.girl));
+              send(
+                COMMAND.ITEM_UPDATE_NTF,
+                0,
+                makeItemUpdateNotification([result.consumedItem]),
+              );
+              if (result.unlockedSecretIds.length > 0) {
+                send(
+                  COMMAND.TASK_VALUE_RSP,
+                  0,
+                  makeTaskValueSync(result.player.taskValues),
+                );
+              }
+              send(
+                COMMAND.NTF_S2C_CALL,
+                0,
+                makeServerLuaCall("GirlLogic", {
+                  sCmd: "GirlGift",
+                  nId: result.girlId,
+                  bLove: result.loved,
+                  nIsMaxlevel: result.reachedMaxLevel,
+                  nAddExp: result.addedExperience,
+                  nOldExp: result.oldExperience,
+                  nNewExp: result.newExperience,
+                  nOldLevel: result.oldLevel,
+                  nNewLevel: result.newLevel,
+                  bAct: result.activityGift,
+                  bSp: result.specialActivityGift,
+                }),
+              );
+              logger.info("girl.gift.sent", {
+                peer,
+                account: context.account,
+                girlId: result.girlId,
+                item: result.item,
+                count: result.count,
+                loved: result.loved,
+                addedExperience: result.addedExperience,
+                oldLevel: result.oldLevel,
+                newLevel: result.newLevel,
+                unlockedSecretIds: result.unlockedSecretIds,
+              });
+            } catch (error) {
+              if (!(error instanceof GirlGiftError)) throw error;
+              send(
+                COMMAND.NTF_S2C_CALL,
+                0,
+                makeServerLuaCall("GirlLogic", {
+                  sCmd: "GirlGift",
+                  nError: error.clientError,
+                }),
+              );
+              logger.warn("girl.gift.rejected", {
+                peer,
+                account: context.account,
+                ...girlGiftCall,
+                reason: error.reason,
+                clientError: error.clientError,
+              });
+            }
+          } else if (girlLevelAwardCall) {
+            try {
+              context.player = await players.claimGirlLevelAward(
+                context.account,
+                girlLevelAwardCall.girlId,
+                girlLevelAwardCall.level,
+              );
+              send(
+                COMMAND.TASK_VALUE_RSP,
+                0,
+                makeTaskValueSync(context.player.taskValues),
+              );
+              send(
+                COMMAND.NTF_S2C_CALL,
+                0,
+                makeServerLuaCall("GirlLogic", {
+                  sCmd: "LevelAward",
+                  nId: girlLevelAwardCall.girlId,
+                  nLevel: girlLevelAwardCall.level,
+                }),
+              );
+              logger.info("girl.level_award.claimed", {
+                peer,
+                account: context.account,
+                ...girlLevelAwardCall,
+              });
+            } catch (error) {
+              if (!(error instanceof GirlLevelAwardError)) throw error;
+              send(
+                COMMAND.NTF_S2C_CALL,
+                0,
+                makeServerLuaCall("GirlLogic", {
+                  sCmd: "LevelAward",
+                  nId: girlLevelAwardCall.girlId,
+                  nLevel: girlLevelAwardCall.level,
+                  nError: 1,
+                }),
+              );
+              logger.warn("girl.level_award.rejected", {
+                peer,
+                account: context.account,
+                ...girlLevelAwardCall,
+                reason: error.reason,
+              });
+            }
           } else if (isHeadTouchedCall(call)) {
             context.player = await players.recordDailyMissionProgress(
               context.account,
