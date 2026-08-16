@@ -39,7 +39,13 @@ import {
   FREE_GIFT_PACK_AWARD,
   FREE_GIFT_PACK_DAILY_LIMIT,
   FREE_GIFT_PACK_ID,
+  makeIBItemTaskId,
   makeIBShopTaskId,
+  makeMonthCardTaskId,
+  MONTH_CARD_DAYS,
+  MONTH_CARD_DIAMONDS,
+  MONTH_CARD_ITEM_ID,
+  MONTH_CARD_LIMIT_DAYS,
 } from "../game-data/ib-shop-data.js";
 import type { Award, BaseAward } from "../game-data/chapter-config.js";
 import {
@@ -56,8 +62,12 @@ import {
   dailySignUpOperationalDate,
   dailySignUpReward,
   makeDailySignUpTaskId,
+  DAILY_SIGN_UP_MONTH_DIAMOND_TASK,
+  DAILY_SIGN_UP_MONTH_ENERGY_TASK,
   DAILY_SIGN_UP_TODAY_TASK,
   DAILY_SIGN_UP_TOTAL_TASK,
+  MONTH_CARD_DAILY_DIAMOND_AWARD,
+  MONTH_CARD_DAILY_ENERGY_AWARD,
 } from "../game-data/daily-sign-up-data.js";
 import {
   activeAwardsWithoutBattlePass,
@@ -444,6 +454,14 @@ export interface IBShopFreePackResult {
   purchaseCount: number;
 }
 
+export interface IBItemFreeResult {
+  player: Player;
+  updatedMoney: MoneyState[];
+  purchaseCount: number;
+  monthCardEndTime: number;
+  diamonds: number;
+}
+
 export class IBShopError extends Error {
   constructor(
     readonly reason: "unknown_item" | "limit_reached",
@@ -506,7 +524,7 @@ export interface GachaCommitResult {
 
 export interface DailySignUpResult {
   player: Player;
-  award: readonly [number, number, number, number, number] | null;
+  awards: BaseAward[];
   fresh: boolean;
   cumulativeCount: number;
   updatedItems: InventoryItemState[];
@@ -951,13 +969,23 @@ function reconcileDailySignUp(player: Player, now = Date.now()): void {
   const cycle = operationalDate.slice(0, 7);
   const todayTaskId = String(makeDailySignUpTaskId(DAILY_SIGN_UP_TODAY_TASK));
   const totalTaskId = String(makeDailySignUpTaskId(DAILY_SIGN_UP_TOTAL_TASK));
+  const monthDiamondTaskId = String(
+    makeDailySignUpTaskId(DAILY_SIGN_UP_MONTH_DIAMOND_TASK),
+  );
+  const monthEnergyTaskId = String(
+    makeDailySignUpTaskId(DAILY_SIGN_UP_MONTH_ENERGY_TASK),
+  );
   if (player.dailySignUp.cycle !== cycle) {
     player.dailySignUp.cycle = cycle;
     player.dailySignUp.lastOperationalDate = null;
     player.taskValues[totalTaskId] = 0;
     player.taskValues[todayTaskId] = 0;
+    player.taskValues[monthDiamondTaskId] = 0;
+    player.taskValues[monthEnergyTaskId] = 0;
   } else if (player.dailySignUp.lastOperationalDate !== operationalDate) {
     player.taskValues[todayTaskId] = 0;
+    player.taskValues[monthDiamondTaskId] = 0;
+    player.taskValues[monthEnergyTaskId] = 0;
   }
 }
 
@@ -1139,11 +1167,13 @@ function grantAwards(
         ? MONEY_GOLD
         : genre === 15 && detail === 2
           ? MONEY_DIAMOND
-          : genre === 15 && detail === 11
-            ? MONEY_CARD_DECOMPOSITION_TOKEN
-            : genre === 15 && detail === 20
-              ? MONEY_WEAPON_DECOMPOSITION_TOKEN
-              : null;
+          : genre === 15 && detail === 4
+            ? MONEY_VIGOUR
+            : genre === 15 && detail === 11
+              ? MONEY_CARD_DECOMPOSITION_TOKEN
+              : genre === 15 && detail === 20
+                ? MONEY_WEAPON_DECOMPOSITION_TOKEN
+                : null;
     if (moneyId !== null) {
       let money = player.money.find(({ id }) => id === moneyId);
       if (!money) {
@@ -1942,7 +1972,7 @@ export class PlayerRepository {
 
   async signUpDaily(account: string, now = Date.now()): Promise<DailySignUpResult> {
     let player: Player | undefined;
-    let award: readonly [number, number, number, number, number] | null = null;
+    const awards: BaseAward[] = [];
     let fresh = false;
     let cumulativeCount = 0;
     const updatedItemGuids = new Set<number>();
@@ -1956,52 +1986,67 @@ export class PlayerRepository {
       const operationalDate = dailySignUpOperationalDate(now);
       const todayTaskId = String(makeDailySignUpTaskId(DAILY_SIGN_UP_TODAY_TASK));
       const totalTaskId = String(makeDailySignUpTaskId(DAILY_SIGN_UP_TOTAL_TASK));
+      const monthDiamondTaskId = String(
+        makeDailySignUpTaskId(DAILY_SIGN_UP_MONTH_DIAMOND_TASK),
+      );
+      const monthEnergyTaskId = String(
+        makeDailySignUpTaskId(DAILY_SIGN_UP_MONTH_ENERGY_TASK),
+      );
       cumulativeCount = Math.max(0, player.taskValues[totalTaskId] ?? 0);
-      if (
+      const alreadySigned =
         player.dailySignUp.lastOperationalDate === operationalDate ||
-        player.taskValues[todayTaskId] === 1
-      ) {
-        return;
-      }
+        player.taskValues[todayTaskId] === 1;
 
-      award = dailySignUpReward(cumulativeCount, operationalDate);
-      if (!award) return;
-
-      const [genre, detail, particular, templateLevel, count] = award;
-      const moneyId =
-        genre === 15 && detail === 1
-          ? MONEY_GOLD
-          : genre === 15 && detail === 2
-            ? MONEY_DIAMOND
-            : null;
-      if (moneyId !== null) {
-        let money = player.money.find(({ id }) => id === moneyId);
-        if (!money) {
-          money = { id: moneyId, count: 0 };
-          player.money.push(money);
+      if (!alreadySigned) {
+        const award = dailySignUpReward(cumulativeCount, operationalDate);
+        if (award) {
+          awards.push(award);
+          grantAwards(player, [award], updatedItemGuids, updatedMoneyIds);
+          cumulativeCount += 1;
+          player.taskValues[todayTaskId] = 1;
+          player.taskValues[totalTaskId] = cumulativeCount;
+          player.dailySignUp = {
+            cycle: operationalDate.slice(0, 7),
+            lastOperationalDate: operationalDate,
+          };
+          const girlReconciliation = reconcileGirlAppearanceState(
+            player,
+            updatedItemGuids,
+          );
+          for (const girlId of girlReconciliation.updatedGirlIds) {
+            updatedGirlIds.add(girlId);
+          }
+          fresh = true;
         }
-        money.count += count;
-        updatedMoneyIds.add(moneyId);
-      } else {
-        addInventoryAward(
-          player,
-          [genre, detail, particular, templateLevel, count],
-          updatedItemGuids,
-        );
       }
 
-      cumulativeCount += 1;
-      player.taskValues[todayTaskId] = 1;
-      player.taskValues[totalTaskId] = cumulativeCount;
-      player.dailySignUp = {
-        cycle: operationalDate.slice(0, 7),
-        lastOperationalDate: operationalDate,
-      };
-      const girlReconciliation = reconcileGirlAppearanceState(player, updatedItemGuids);
-      for (const girlId of girlReconciliation.updatedGirlIds) {
-        updatedGirlIds.add(girlId);
+      // 月卡持有者的每日钻石/体力签到（UI_SignActivity 读组20的11004/11005）。
+      // 即使当天普通签到已完成也要补签月卡部分（先签到后购卡的边缘情况），
+      // 否则客户端签到按钮常亮、登录弹窗反复出现。
+      const nowSeconds = Math.floor(now / 1000);
+      const monthCardEnd = player.taskValues[String(makeMonthCardTaskId())] ?? 0;
+      if (monthCardEnd >= nowSeconds) {
+        if ((player.taskValues[monthDiamondTaskId] ?? 0) === 0) {
+          player.taskValues[monthDiamondTaskId] = 1;
+          awards.push(MONTH_CARD_DAILY_DIAMOND_AWARD);
+          grantAwards(
+            player,
+            [MONTH_CARD_DAILY_DIAMOND_AWARD],
+            updatedItemGuids,
+            updatedMoneyIds,
+          );
+        }
+        if ((player.taskValues[monthEnergyTaskId] ?? 0) === 0) {
+          player.taskValues[monthEnergyTaskId] = 1;
+          awards.push(MONTH_CARD_DAILY_ENERGY_AWARD);
+          grantAwards(
+            player,
+            [MONTH_CARD_DAILY_ENERGY_AWARD],
+            updatedItemGuids,
+            updatedMoneyIds,
+          );
+        }
       }
-      fresh = true;
     });
     if (!player) throw new Error(`Failed to sign in player: ${account}`);
     const snapshot = structuredClone(player);
@@ -2010,11 +2055,11 @@ export class PlayerRepository {
       operationalDate: dailySignUpOperationalDate(now),
       cumulativeCount,
       fresh,
-      award,
+      awards,
     });
     return {
       player: snapshot,
-      award,
+      awards,
       fresh,
       cumulativeCount,
       updatedItems: snapshot.inventory.filter(({ guid }) => updatedItemGuids.has(guid)),
@@ -2252,6 +2297,59 @@ export class PlayerRepository {
       itemGuid,
     });
     return { player: snapshot, item: claimedItem, purchaseCount };
+  }
+
+  async claimIBItemFree(
+    account: string,
+    itemId: number,
+    now = Date.now(),
+  ): Promise<IBItemFreeResult> {
+    if (itemId !== MONTH_CARD_ITEM_ID) throw new IBShopError("unknown_item");
+    let player: Player | undefined;
+    let purchaseCount = 0;
+    let monthCardEndTime = 0;
+    const updatedMoneyIds = new Set<number>();
+    await this.#store.update((state) => {
+      player = state.players[account];
+      if (!player) throw new Error(`Unknown player account: ${account}`);
+      const taskId = String(makeIBItemTaskId(itemId));
+      purchaseCount = (player.taskValues[taskId] ?? 0) + 1;
+      player.taskValues[taskId] = purchaseCount;
+
+      let diamond = player.money.find(({ id }) => id === MONEY_DIAMOND);
+      if (!diamond) {
+        diamond = { id: MONEY_DIAMOND, count: 0 };
+        player.money.push(diamond);
+      }
+      diamond.count += MONTH_CARD_DIAMONDS;
+      updatedMoneyIds.add(MONEY_DIAMOND);
+
+      const monthTaskId = String(makeMonthCardTaskId());
+      const nowSeconds = Math.floor(now / 1000);
+      const currentEnd = player.taskValues[monthTaskId] ?? 0;
+      const base = Math.max(nowSeconds, currentEnd);
+      monthCardEndTime = Math.min(
+        base + MONTH_CARD_DAYS * 86_400,
+        nowSeconds + MONTH_CARD_LIMIT_DAYS * 86_400,
+      );
+      player.taskValues[monthTaskId] = monthCardEndTime;
+    });
+    if (!player) throw new Error(`Failed to claim IB item: ${account}`);
+    const snapshot = structuredClone(player);
+    this.#logger.info("player.ib_item.free_claimed", {
+      account,
+      itemId,
+      purchaseCount,
+      diamonds: MONTH_CARD_DIAMONDS,
+      monthCardEndTime,
+    });
+    return {
+      player: snapshot,
+      updatedMoney: snapshot.money.filter(({ id }) => updatedMoneyIds.has(id)),
+      purchaseCount,
+      monthCardEndTime,
+      diamonds: MONTH_CARD_DIAMONDS,
+    };
   }
 
   async performGacha(

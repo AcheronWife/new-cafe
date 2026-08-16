@@ -7,7 +7,13 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   FREE_GIFT_PACK_AWARD,
   FREE_GIFT_PACK_ID,
+  makeIBItemTaskId,
   makeIBShopTaskId,
+  makeMonthCardTaskId,
+  MONTH_CARD_DAYS,
+  MONTH_CARD_DIAMONDS,
+  MONTH_CARD_ITEM_ID,
+  MONTH_CARD_LIMIT_DAYS,
 } from "../src/game-data/ib-shop-data.js";
 import type { Logger } from "../src/logger.js";
 import { JsonStore } from "../src/persistence/json-store.js";
@@ -111,5 +117,62 @@ describe("ib shop free pack persistence", () => {
     await expect(repository.claimIBShopFreePack("nobody", NOW)).rejects.toThrow(
       "Unknown player account: nobody",
     );
+  });
+});
+
+describe("ib item month card persistence", () => {
+  const monthTaskId = String(makeMonthCardTaskId());
+
+  it("grants diamonds, extends the month card and counts the purchase", async () => {
+    const repository = await createRepository();
+    const result = await repository.claimIBItemFree("tester", MONTH_CARD_ITEM_ID, NOW);
+    expect(result.purchaseCount).toBe(1);
+    expect(result.diamonds).toBe(MONTH_CARD_DIAMONDS);
+    const diamond = result.updatedMoney.find(({ id }) => id === 3);
+    expect(diamond?.count).toBe(MONTH_CARD_DIAMONDS);
+    const nowSeconds = Math.floor(NOW / 1000);
+    expect(result.monthCardEndTime).toBe(nowSeconds + MONTH_CARD_DAYS * 86_400);
+    expect(result.player.taskValues[monthTaskId]).toBe(result.monthCardEndTime);
+    expect(result.player.taskValues[String(makeIBItemTaskId(MONTH_CARD_ITEM_ID))]).toBe(
+      1,
+    );
+  });
+
+  it("extends from the current end time when the card is still active", async () => {
+    const repository = await createRepository();
+    const first = await repository.claimIBItemFree("tester", MONTH_CARD_ITEM_ID, NOW);
+    const second = await repository.claimIBItemFree(
+      "tester",
+      MONTH_CARD_ITEM_ID,
+      NOW + 3_600_000,
+    );
+    expect(second.purchaseCount).toBe(2);
+    expect(second.monthCardEndTime).toBe(
+      first.monthCardEndTime + MONTH_CARD_DAYS * 86_400,
+    );
+    const diamond = second.player.money.find(({ id }) => id === 3);
+    expect(diamond?.count).toBe(MONTH_CARD_DIAMONDS * 2);
+  });
+
+  it("caps the month card end time at the 330 day limit", async () => {
+    const repository = await createRepository();
+    const nowSeconds = Math.floor(NOW / 1000);
+    const nearCap = nowSeconds + (MONTH_CARD_LIMIT_DAYS - 5) * 86_400;
+    await repository.setTaskValues("tester", [
+      { id: makeMonthCardTaskId(), value: nearCap },
+    ]);
+    const result = await repository.claimIBItemFree("tester", MONTH_CARD_ITEM_ID, NOW);
+    expect(result.monthCardEndTime).toBe(nowSeconds + MONTH_CARD_LIMIT_DAYS * 86_400);
+  });
+
+  it("rejects unknown ib items", async () => {
+    const repository = await createRepository();
+    await expect(repository.claimIBItemFree("tester", 999, NOW)).rejects.toThrow(
+      IBShopError,
+    );
+    await repository.claimIBItemFree("tester", 999, NOW).catch((error: unknown) => {
+      expect((error as IBShopError).reason).toBe("unknown_item");
+      expect((error as IBShopError).clientError).toBe(20074);
+    });
   });
 });

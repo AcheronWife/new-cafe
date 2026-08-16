@@ -3,6 +3,16 @@ import type { BaseAward } from "./chapter-config.js";
 export const DAILY_SIGN_UP_TASK_GROUP = 20;
 export const DAILY_SIGN_UP_TODAY_TASK = 11_001;
 export const DAILY_SIGN_UP_TOTAL_TASK = 11_002;
+// NormalActivityConfig.TID_MONTHSIGN / TID_MONTHSIGN_Energy：月卡每日钻石与
+// 体力的签到状态，0 未签 1 已签，4 点随 11001 一起清空。
+export const DAILY_SIGN_UP_MONTH_DIAMOND_TASK = 11_004;
+export const DAILY_SIGN_UP_MONTH_ENERGY_TASK = 11_005;
+
+// 月卡日奖励数值来自 ItemList 的 IBMonthCardAuto（[14,2,1,1]）：
+// ExtParam2=50 → 每日钻石；ExtParam3=30 → 每日体力（genre 15 detail 4 为
+// ItemEnergyAuto）。UI_SignActivity 的 monthText 展示的正是 ExtParam2。
+export const MONTH_CARD_DAILY_DIAMOND_AWARD: BaseAward = [15, 2, 1, 1, 50];
+export const MONTH_CARD_DAILY_ENERGY_AWARD: BaseAward = [15, 4, 1, 1, 30];
 
 export function makeDailySignUpTaskId(taskId: number): number {
   return (DAILY_SIGN_UP_TASK_GROUP << 16) | taskId;

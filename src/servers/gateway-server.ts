@@ -66,6 +66,8 @@ import {
   FREE_GIFT_PACK_ID,
   IB_SHOP_ERROR_UNKNOWN_ITEM,
   LUA_COMMAND_DO_RECHARGE,
+  LUA_COMMAND_PAY_RESULT_SUCCESS,
+  MONTH_CARD_ITEM_ID,
 } from "../game-data/ib-shop-data.js";
 import {
   getPhoneLetterDefinition,
@@ -878,7 +880,7 @@ export function createGatewayServer({
               nType: 3,
               nSubType: 1,
               bSuccess: true,
-              tbAward: result.award ? [result.award] : [],
+              tbAward: result.awards,
               isRefreshSign: result.fresh,
             }),
           );
@@ -889,7 +891,7 @@ export function createGatewayServer({
             feature: "daily_sign_up",
             fresh: result.fresh,
             cumulativeCount: result.cumulativeCount,
-            award: result.award,
+            awards: result.awards,
           });
           return;
         }
@@ -3134,20 +3136,9 @@ export function createGatewayServer({
               );
             };
             if (
-              doRechargeCall.shopType !== 1 ||
-              doRechargeCall.id !== FREE_GIFT_PACK_ID
+              doRechargeCall.shopType === 1 &&
+              doRechargeCall.id === FREE_GIFT_PACK_ID
             ) {
-              sendRechargeCallback({
-                Type: doRechargeCall.shopType,
-                Id: doRechargeCall.id,
-                Error: IB_SHOP_ERROR_UNKNOWN_ITEM,
-              });
-              logger.warn("ib_shop.unsupported", {
-                peer,
-                account: context.account,
-                ...doRechargeCall,
-              });
-            } else {
               try {
                 const result = await players.claimIBShopFreePack(context.account);
                 context.player = result.player;
@@ -3189,6 +3180,83 @@ export function createGatewayServer({
                   clientError: error.clientError,
                 });
               }
+            } else if (
+              doRechargeCall.shopType === 2 &&
+              doRechargeCall.id === MONTH_CARD_ITEM_ID
+            ) {
+              try {
+                const result = await players.claimIBItemFree(
+                  context.account,
+                  doRechargeCall.id,
+                );
+                context.player = result.player;
+                for (const money of result.updatedMoney) {
+                  send(COMMAND.MONEY_UPDATE_NTF, 0, makeMoneyUpdateNotification(money));
+                }
+                send(
+                  COMMAND.TASK_VALUE_RSP,
+                  0,
+                  makeTaskValueSync(result.player.taskValues),
+                );
+                sendRechargeCallback({
+                  Type: 2,
+                  Id: MONTH_CARD_ITEM_ID,
+                  Error: 0,
+                  TradeNo: `offline-${Date.now()}`,
+                  Unit: "CNY",
+                  CallBackUrl: "",
+                });
+                send(
+                  COMMAND.NTF_S2C_CALL,
+                  0,
+                  makeServerLuaCall("BuyMonth", {
+                    nType: 2,
+                    bMonth: 1,
+                    nId: MONTH_CARD_ITEM_ID,
+                  }),
+                );
+                send(
+                  COMMAND.NTF_S2C_CALL,
+                  0,
+                  makeServerLuaCall("LuaCall", {
+                    sCmd: LUA_COMMAND_PAY_RESULT_SUCCESS,
+                    tbParam: { nAllTimes: result.purchaseCount, nDailyTimes: 1 },
+                  }),
+                );
+                logger.info("ib_item.month_card.claimed", {
+                  peer,
+                  account: context.account,
+                  itemId: MONTH_CARD_ITEM_ID,
+                  purchaseCount: result.purchaseCount,
+                  diamonds: result.diamonds,
+                  monthCardEndTime: result.monthCardEndTime,
+                });
+              } catch (error) {
+                if (!(error instanceof IBShopError)) throw error;
+                sendRechargeCallback({
+                  Type: 2,
+                  Id: MONTH_CARD_ITEM_ID,
+                  Error: error.clientError,
+                });
+                logger.warn("ib_item.month_card.rejected", {
+                  peer,
+                  account: context.account,
+                  itemId: MONTH_CARD_ITEM_ID,
+                  reason: error.reason,
+                  clientError: error.clientError,
+                });
+              }
+            } else {
+              sendRechargeCallback({
+                Type: doRechargeCall.shopType,
+                Id: doRechargeCall.id,
+                Error: IB_SHOP_ERROR_UNKNOWN_ITEM,
+              });
+              logger.warn("ib_shop.unsupported", {
+                peer,
+                account: context.account,
+                ...doRechargeCall,
+              });
             }
           } else {
             logger.warn("lua.unhandled", {
