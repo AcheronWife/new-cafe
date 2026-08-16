@@ -49,6 +49,7 @@ async function awardWeapon(repository: PlayerRepository) {
     1,
     1,
     3,
+    0,
     [[2, 1, 15, 1, 1, 10_000]],
     0,
   );

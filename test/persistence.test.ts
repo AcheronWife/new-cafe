@@ -143,13 +143,12 @@ it("persists player and task changes atomically", async () => {
     expect(cafePlayer.cafe).toEqual({
       coffees: [{ coffeetype: 3, count: 240 }],
     });
-    const enteredPlayer = await repository.enterLevel("tester", 3);
-    expect(enteredPlayer.money[0]?.count).toBe(25);
     const settlement = await repository.settleLevel(
       "tester",
       1,
       1,
       1,
+      3,
       3,
       [
         [15, 1, 1, 1, 1_000, 0],
@@ -271,6 +270,7 @@ it("persists player and task changes atomically", async () => {
       2,
       1,
       3,
+      0,
       [
         [1, 1, 81, 5, 1, 100],
         [1, 201, 1, 4, 1, 100],

@@ -301,6 +301,7 @@ export interface TaskChange {
 
 export interface ChapterSettlement {
   player: Player;
+  energyCost: number;
   updatedItems: InventoryItemState[];
   updatedMoney: MoneyState[];
   updatedGirls: GirlState[];
@@ -2998,7 +2999,7 @@ export class PlayerRepository {
     };
   }
 
-  async enterLevel(account: string, energyCost: number): Promise<Player> {
+  async chargeLevelVigour(account: string, energyCost: number): Promise<Player> {
     if (!Number.isSafeInteger(energyCost) || energyCost < 0) {
       throw new Error(`Invalid level energy cost: ${energyCost}`);
     }
@@ -3019,8 +3020,8 @@ export class PlayerRepository {
       }
       incrementDailyMissionProgress(player, 109, energyCost);
     });
-    this.#logger.info("player.level.entered", { account, energyCost });
-    if (!player) throw new Error(`Failed to enter level: ${account}`);
+    this.#logger.info("player.level.vigour_charged", { account, energyCost });
+    if (!player) throw new Error(`Failed to charge level vigour: ${account}`);
     return structuredClone(player);
   }
 
@@ -3141,6 +3142,7 @@ export class PlayerRepository {
     index: number,
     difficulty: number,
     star: number,
+    energyCost: number,
     awards: readonly Award[],
     masterExp: number,
   ): Promise<ChapterSettlement> {
@@ -3150,6 +3152,9 @@ export class PlayerRepository {
       )
     ) {
       throw new Error("Invalid level coordinates");
+    }
+    if (!Number.isSafeInteger(energyCost) || energyCost < 0) {
+      throw new Error(`Invalid level energy cost: ${energyCost}`);
     }
 
     const levelId = makeLevelId(chapter, index, difficulty);
@@ -3162,6 +3167,19 @@ export class PlayerRepository {
     await this.#store.update((state) => {
       player = state.players[account];
       if (!player) throw new Error(`Unknown player account: ${account}`);
+
+      let vigour = player.money.find(({ id }) => id === MONEY_VIGOUR);
+      const available = vigour?.count ?? 0;
+      if (available < energyCost) {
+        throw new InsufficientVigourError(energyCost, available);
+      }
+      if (!vigour) {
+        vigour = { id: MONEY_VIGOUR, count: 0 };
+        player.money.push(vigour);
+      }
+      vigour.count -= energyCost;
+      updatedMoneyIds.add(MONEY_VIGOUR);
+      incrementDailyMissionProgress(player, 109, energyCost);
 
       const level = player.levels.find(({ id }) => id === levelId);
       const firstClear = !level || level.star >>> 3 === 0;
@@ -3283,6 +3301,7 @@ export class PlayerRepository {
       account,
       levelId,
       star: starMask,
+      energyCost,
       awards,
       masterExp,
       experienceUpdate,
@@ -3290,6 +3309,7 @@ export class PlayerRepository {
     const snapshot = structuredClone(player);
     return {
       player: snapshot,
+      energyCost,
       updatedItems: snapshot.inventory.filter(({ guid }) => updatedItemGuids.has(guid)),
       updatedMoney: snapshot.money.filter(({ id }) => updatedMoneyIds.has(id)),
       updatedGirls: snapshot.girls.filter(({ girlId }) => updatedGirlIds.has(girlId)),

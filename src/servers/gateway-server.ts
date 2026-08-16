@@ -34,7 +34,6 @@ import {
   ChapterCatalog,
   effectiveEnergyCost,
   rollChapterAwards,
-  type ChapterLevelConfig,
 } from "../game-data/chapter-config.js";
 import {
   LUA_COMMAND_CAFE_ADD_GUEST_WEIGHT,
@@ -118,19 +117,16 @@ interface GatewayServerOptions {
   players: PlayerRepository;
 }
 
+const SETTLEMENT_CACHE_TTL_MS = 120_000;
+
 interface ConnectionContext {
   account: string;
   player: Player | null;
   isNewPlayer: boolean;
-  activeChapter: {
-    level: ChapterLevelConfig;
-    firstClear: boolean;
-    passCount: number;
-  } | null;
-  lastSettlement: {
-    key: string;
-    response: Record<string, unknown>;
-  } | null;
+  settlementResponses: Map<
+    string,
+    { response: Record<string, unknown>; expiresAt: number }
+  >;
   activeBounty: {
     run: BountyRun;
     formationId: number;
@@ -393,20 +389,6 @@ interface ChapterCall {
   parameters: Record<string, unknown>;
 }
 
-export function chapterSettlementMatchesActiveLevel(
-  activeLevel: Pick<ChapterLevelConfig, "chapter" | "index" | "difficulty"> | null,
-  chapter: number,
-  index: number,
-  difficulty: number,
-): boolean {
-  return (
-    activeLevel !== null &&
-    activeLevel.chapter === chapter &&
-    activeLevel.index === index &&
-    activeLevel.difficulty === difficulty
-  );
-}
-
 function parseChapterCall(call: LuaCall | null): ChapterCall | null {
   if (!call || typeof call.parameters !== "object" || call.parameters === null) {
     return null;
@@ -599,8 +581,7 @@ export function createGatewayServer({
       account: "offline",
       player: null,
       isNewPlayer: false,
-      activeChapter: null,
-      lastSettlement: null,
+      settlementResponses: new Map(),
       activeBounty: null,
       lastBountySettlement: null,
     };
@@ -2526,21 +2507,18 @@ export function createGatewayServer({
 
             const player =
               context.player ?? (await players.getOrCreate(context.account));
-            const levelId = makeLevelId(chapter, index, difficulty);
-            const previous = player.levels.find(({ id }) => id === levelId);
-            const passCount = (previous?.star ?? 0) >>> 3;
+            context.player = player;
             const energyCost = effectiveEnergyCost(level, player.level);
-            try {
-              context.player = await players.enterLevel(context.account, energyCost);
-            } catch (error) {
-              if (!(error instanceof InsufficientVigourError)) throw error;
+            const availableVigour =
+              player.money.find(({ id }) => id === MONEY_VIGOUR)?.count ?? 0;
+            if (availableVigour < energyCost) {
               logger.info("chapter.enter.insufficient_vigour", {
                 account: context.account,
                 chapter,
                 index,
                 difficulty,
-                required: error.required,
-                available: error.available,
+                required: energyCost,
+                available: availableVigour,
               });
               send(
                 COMMAND.NTF_S2C_CALL,
@@ -2552,21 +2530,6 @@ export function createGatewayServer({
               );
               return;
             }
-            context.activeChapter = {
-              level,
-              firstClear: passCount === 0,
-              passCount,
-            };
-            context.lastSettlement = null;
-            const vigour = context.player.money.find(({ id }) => id === MONEY_VIGOUR);
-            if (vigour) {
-              send(COMMAND.MONEY_UPDATE_NTF, 0, makeMoneyUpdateNotification(vigour));
-            }
-            send(
-              COMMAND.TASK_VALUE_RSP,
-              0,
-              makeTaskValueSync(context.player.taskValues),
-            );
             send(
               COMMAND.NTF_S2C_CALL,
               0,
@@ -2586,106 +2549,144 @@ export function createGatewayServer({
               index,
               difficulty,
               energyCost,
-              remainingVigour: vigour?.count ?? 0,
+              availableVigour,
             });
           } else if (chapterCall?.state === 1) {
             const chapter = Number(chapterCall.parameters.Chapter);
             const index = Number(chapterCall.parameters.Index);
             const difficulty = Number(chapterCall.parameters.Difficult);
             const star = Number(chapterCall.parameters.nStar) || 0;
-            const settlementKey = `${chapter}:${index}:${difficulty}:${star}`;
-            if (context.lastSettlement?.key === settlementKey) {
+            // The client resends an identical settlement payload roughly every
+            // 2 seconds until it receives a response, so dedupe by the full
+            // payload (battle stats included) instead of just the coordinates:
+            // replays of the same level produce different stats and must
+            // settle normally.
+            const settlementKey = JSON.stringify(chapterCall.parameters);
+            const cached = context.settlementResponses.get(settlementKey);
+            if (cached && cached.expiresAt > Date.now()) {
               send(
                 COMMAND.NTF_S2C_CALL,
                 0,
-                makeServerLuaCall("ChapterMsg", context.lastSettlement.response),
+                makeServerLuaCall("ChapterMsg", cached.response),
               );
               return;
             }
 
-            const activeChapter = context.activeChapter;
-            if (
-              !activeChapter ||
-              !chapterSettlementMatchesActiveLevel(
-                activeChapter.level,
-                chapter,
-                index,
-                difficulty,
-              )
-            ) {
-              logger.warn("chapter.settlement.stale", {
+            const level = chapterCatalog.get(chapter, index, difficulty);
+            if (!level) {
+              logger.warn("chapter.settlement.unknown", {
                 account: context.account,
                 chapter,
                 index,
                 difficulty,
                 star,
-                activeChapter: context.activeChapter
-                  ? {
-                      chapter: context.activeChapter.level.chapter,
-                      index: context.activeChapter.level.index,
-                      difficulty: context.activeChapter.level.difficulty,
-                    }
-                  : null,
               });
               return;
             }
+            const player =
+              context.player ?? (await players.getOrCreate(context.account));
+            context.player = player;
+            const levelId = makeLevelId(chapter, index, difficulty);
+            const previous = player.levels.find(({ id }) => id === levelId);
+            const passCount = (previous?.star ?? 0) >>> 3;
+            const firstClear = passCount === 0;
+            const energyCost = effectiveEnergyCost(level, player.level);
 
             let completedStar = star;
             let awards: ReturnType<typeof rollChapterAwards> = [];
             let masterExp = 0;
             let cardExp = 0;
-            if (star > 0) {
-              const level = activeChapter.level;
-              const levelId = makeLevelId(chapter, index, difficulty);
-              const passCount = activeChapter.passCount;
-              const firstClear = activeChapter.firstClear;
-              awards = rollChapterAwards(
-                level,
-                firstClear,
-                `${context.account}:${levelId}:${passCount}`,
-              );
-              masterExp = level.masterExp;
-              cardExp = level.cardExp;
-              const settlement = await players.settleLevel(
-                context.account,
+            try {
+              if (star > 0) {
+                awards = rollChapterAwards(
+                  level,
+                  firstClear,
+                  `${context.account}:${levelId}:${passCount}`,
+                );
+                masterExp = level.masterExp;
+                cardExp = level.cardExp;
+                const settlement = await players.settleLevel(
+                  context.account,
+                  chapter,
+                  index,
+                  difficulty,
+                  star,
+                  energyCost,
+                  awards,
+                  masterExp,
+                );
+                context.player = settlement.player;
+                completedStar =
+                  context.player.levels.find(({ id }) => id === levelId)?.star ?? star;
+                for (const money of settlement.updatedMoney) {
+                  send(COMMAND.MONEY_UPDATE_NTF, 0, makeMoneyUpdateNotification(money));
+                }
+                if (settlement.updatedItems.length > 0) {
+                  send(
+                    COMMAND.ITEM_UPDATE_NTF,
+                    0,
+                    makeItemUpdateNotification(settlement.updatedItems),
+                  );
+                }
+                sendGirlUpdates(settlement.updatedGirls);
+                send(
+                  COMMAND.TASK_VALUE_RSP,
+                  0,
+                  makeTaskValueSync(settlement.player.taskValues),
+                );
+                if (
+                  settlement.experienceUpdate.addedExperience > 0 ||
+                  settlement.experienceUpdate.levelsGained > 0
+                ) {
+                  send(
+                    COMMAND.PLAYER_UPDATE_NTF,
+                    0,
+                    makePlayerUpdateNotification(settlement.player),
+                  );
+                }
+              } else {
+                // A failed fight still consumes vigour, matching the original
+                // pre-deduct behaviour.
+                context.player = await players.chargeLevelVigour(
+                  context.account,
+                  energyCost,
+                );
+                const vigour = context.player.money.find(
+                  ({ id }) => id === MONEY_VIGOUR,
+                );
+                if (vigour) {
+                  send(
+                    COMMAND.MONEY_UPDATE_NTF,
+                    0,
+                    makeMoneyUpdateNotification(vigour),
+                  );
+                }
+                send(
+                  COMMAND.TASK_VALUE_RSP,
+                  0,
+                  makeTaskValueSync(context.player.taskValues),
+                );
+              }
+            } catch (error) {
+              if (!(error instanceof InsufficientVigourError)) throw error;
+              logger.info("chapter.settlement.insufficient_vigour", {
+                account: context.account,
                 chapter,
                 index,
                 difficulty,
                 star,
-                awards,
-                masterExp,
-              );
-              context.player = settlement.player;
-              completedStar =
-                context.player.levels.find(
-                  ({ id }) => id === makeLevelId(chapter, index, difficulty),
-                )?.star ?? star;
-              for (const money of settlement.updatedMoney) {
-                send(COMMAND.MONEY_UPDATE_NTF, 0, makeMoneyUpdateNotification(money));
-              }
-              if (settlement.updatedItems.length > 0) {
-                send(
-                  COMMAND.ITEM_UPDATE_NTF,
-                  0,
-                  makeItemUpdateNotification(settlement.updatedItems),
-                );
-              }
-              sendGirlUpdates(settlement.updatedGirls);
+                required: error.required,
+                available: error.available,
+              });
               send(
-                COMMAND.TASK_VALUE_RSP,
+                COMMAND.NTF_S2C_CALL,
                 0,
-                makeTaskValueSync(settlement.player.taskValues),
+                makeServerLuaCall("ChapterMsg", {
+                  nError: 20014,
+                  nState: 1,
+                }),
               );
-              if (
-                settlement.experienceUpdate.addedExperience > 0 ||
-                settlement.experienceUpdate.levelsGained > 0
-              ) {
-                send(
-                  COMMAND.PLAYER_UPDATE_NTF,
-                  0,
-                  makePlayerUpdateNotification(settlement.player),
-                );
-              }
+              return;
             }
             const response = {
               nError: 0,
@@ -2697,8 +2698,10 @@ export function createGatewayServer({
                 CardExp: cardExp,
               },
             };
-            context.lastSettlement = { key: settlementKey, response };
-            context.activeChapter = null;
+            context.settlementResponses.set(settlementKey, {
+              response,
+              expiresAt: Date.now() + SETTLEMENT_CACHE_TTL_MS,
+            });
             send(COMMAND.NTF_S2C_CALL, 0, makeServerLuaCall("ChapterMsg", response));
             logger.info("lua.callback", {
               peer,
@@ -2708,7 +2711,8 @@ export function createGatewayServer({
               chapter,
               index,
               difficulty,
-              firstClear: activeChapter.firstClear,
+              firstClear,
+              energyCost,
               awards,
               masterExp,
               cardExp,
