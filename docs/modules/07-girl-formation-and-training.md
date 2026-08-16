@@ -2,7 +2,7 @@
 
 ## 当前完成度
 
-外观和编队为**核心可用**，少女特训为**MVP**。
+外观、编队和送礼为**核心可用**，少女特训为**MVP**。
 
 ## 少女与外观
 
@@ -14,6 +14,36 @@
 - `HeadTouched`：原样回调，满足主界面互动和部分引导。
 
 角色卡到少女、服装和主少女的自动投影见物品模块文档。
+
+## 送礼
+
+完整考据与实现过程见 [GirlGift 服务端补全全记录](../girl-gift-implementation.md)。
+
+支持 `GirlLogic GirlGift {nId, tbItem=[G,D,P,L], ItemNum}`（`ItemNum` 缺省为 1）：
+
+- 礼物经验完全取自客户端 `Item/ItemList.txt` 的 ExtParam1：1～16 号少女各有
+  60/300 的专属礼物（`5-1-N-2/4`），联动少女 201～204 各有一个 500 的
+  （`5-1-N-4`），通用礼物为 `5-2-1-1..8`（30/60/150/300/150/300/300/300）；
+- 喜爱礼物按 `UI_GirlGift` 的规则加成 1.25 倍（联动少女 2 倍），向下取整；
+- 好感升级完整复刻原服务端 `GirlCommon:Add`：按 `Girl/Friendliness.txt` 的
+  Exp/LinkExp 曲线逐级扣减，普通少女上限 100 级、联动少女 50 级，溢出经验
+  丢弃而不是结转；
+- 成功时依次发送 `GIRL_UPDATE_NTF`（新等级与经验）、`ITEM_UPDATE_NTF`
+  （消耗后的礼物堆叠）、解锁秘密时的 `TASK_VALUE_RSP`，最后是
+  `GirlLogic GirlGift` 回调，字段与客户端 `OnGirlGift` 一一对应
+  （`bLove/nIsMaxlevel/nAddExp/nOldExp/nNewExp/nOldLevel/nNewLevel/bAct/bSp`）；
+- `bAct/bSp` 复刻 `HandWorkLogic:GiftState`：手作教室（活动 120，
+  2021-07-30 ～ 2021-08-20）窗口已过，两个标志恒为 false，窗口判断保留；
+- 秘密解锁：送出喜爱礼物解锁对应 `Secret` 任务位（1～16 号为 11/12，联动
+  少女为 5）；升级跨过 `Secret.txt` 的 FitLove 阈值（10/20/30…100）时解锁
+  对应秘密位；
+- 错误码：`1` 参数非法、`2` 礼物未知或数量不足、`3` 少女未拥有、`4` 已满级
+  （客户端 `OnGirlGiftError` 只对 4 弹“好感度已满级”）。
+
+支持 `GirlLogic LevelAward {nId, nLevel}`：好感每跨 10 级客户端会调用一次，
+服务端把 `LevelAward` 任务位（组 3，`(girlId-1)*2000+500+index-1`，联动少女
+走组 90）标记为 1 并原样回调。该命令只是领取标记，配置中每 10 级的奖励
+（`FriendlinessUnlock.txt`）没有实物，客户端奖励界面由本地数据驱动。
 
 ## 编队
 
@@ -36,6 +66,10 @@
 ## 验证
 
 - `test/girl-training-data.test.ts` 覆盖训练配置和非法位置；
+- `test/girl-gift-data.test.ts` 覆盖礼物经验、好感曲线、升级截断和
+  手作活动窗口；
+- `test/girl-gift-persistence.test.ts` 覆盖送礼扣减、喜爱加成、秘密解锁、
+  满级与参数错误、联动少女和 `LevelAward` 幂等；
 - `test/persistence.test.ts` 覆盖少女外观、特训和编队持久化；
 - `test/protocol.test.ts` 覆盖少女、编队通知编码。
 
@@ -44,6 +78,8 @@
 - `EndTrain` 尚未实现，运行日志中仍能观察到未处理请求；
 - 不发放特训好感与晶石奖励，也不清理训练占位；
 - 指引任务“安排四种不同特训”没有接入事件；
-- 少女等级、好感、礼物、疲劳恢复和咖啡馆派驻未形成完整玩法；
+- 好感升级的配套系统（羁绊剧情 `CalPlotByLevel`、升级触发的私信事件
+  `PhoneEventCheck(3)`、成就 `OnAddFriendLevel`）未接入；
+- 少女疲劳恢复和咖啡馆派驻未形成完整玩法；
 - 编队战力没有计算，`fightPower` 也不会随编队变化；
 - 支援/助战配置任务没有实现。

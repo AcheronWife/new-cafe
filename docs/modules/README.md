@@ -2,7 +2,7 @@
 
 更新时间：2026-07-29
 
-本目录依据当前源码、配置、32 个测试文件和实际 `schemaVersion=1` 存档走查整理。
+本目录依据当前源码、配置、34 个测试文件和实际 `schemaVersion=1` 存档走查整理。
 完成度采用以下口径：
 
 - **闭环**：核心状态持久化，正常/重复/失败路径基本完整，并有自动化验证；
@@ -20,7 +20,7 @@
 | [持久化、玩家与登录](04-persistence-player-and-session.md) | 核心可用      | 原子 JSON v1 存档、建号和登录同步            |
 | [物品、奖励与少女名册](05-inventory-rewards-and-roster.md) | 核心可用      | 统一背包、锁定、分解奖励和少女状态投影       |
 | [关卡与玩家成长](06-chapter-and-progression.md)            | 核心可用      | 528 关配置、体力、掉落、星级、经验和活动事件 |
-| [少女、编队与特训](07-girl-formation-and-training.md)      | MVP/核心可用  | 外观与编队可用，特训只有开始链路             |
+| [少女、编队与特训](07-girl-formation-and-training.md)      | MVP/核心可用  | 外观、编队与送礼可用，特训只有开始链路       |
 | [角色卡与武器强化](08-card-and-weapon-enhancement.md)      | 核心可用      | 强化、实例锁定、角色卡和武器分解             |
 | [角色与武器抽卡](09-gacha.md)                              | 核心可用      | 原概率表、保底、UP、自选、暂存和成本结算     |
 | [任务与活动引擎](10-task-and-activity-engine.md)           | 核心可用      | 领域事件、指引日程与服务端权威日常任务       |
@@ -37,7 +37,7 @@
 ## 自动化验证现状
 
 `pnpm check` 会运行格式检查、ESLint、TypeScript 严格类型检查、Vitest 和生产
-构建。当前共有 32 个测试文件、95 项测试。数据算法和 Repository 的覆盖较好，
+构建。当前共有 34 个测试文件、109 项测试。数据算法和 Repository 的覆盖较好，
 但 HTTP/TCP 服务器没有端到端 socket 测试，很多 Lua 回调只经过设备日志验证。
 
 ## 当前最重要的共性缺口
