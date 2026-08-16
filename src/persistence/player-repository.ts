@@ -35,6 +35,12 @@ import {
   weaponDecompositionReward,
 } from "../game-data/weapon-decomposition-data.js";
 import { INITIAL_COFFEE_TASK_VALUES, type CafeCoffee } from "../game-data/cafe-data.js";
+import {
+  FREE_GIFT_PACK_AWARD,
+  FREE_GIFT_PACK_DAILY_LIMIT,
+  FREE_GIFT_PACK_ID,
+  makeIBShopTaskId,
+} from "../game-data/ib-shop-data.js";
 import type { Award, BaseAward } from "../game-data/chapter-config.js";
 import {
   chapterStarAward,
@@ -285,6 +291,7 @@ export interface Player {
   dailySignUp: DailySignUpState;
   eightDaySignUp: EightDaySignUpState;
   bounty?: BountyState;
+  ibShop?: IBShopState;
 }
 
 export interface PersistedState {
@@ -424,6 +431,26 @@ export class GirlLevelAwardError extends Error {
   constructor(readonly reason: "girl_not_owned" | "invalid_level") {
     super(`Girl level award error: ${reason}`);
     this.name = "GirlLevelAwardError";
+  }
+}
+
+export interface IBShopState {
+  operationalDate: string;
+}
+
+export interface IBShopFreePackResult {
+  player: Player;
+  item: InventoryEntryState;
+  purchaseCount: number;
+}
+
+export class IBShopError extends Error {
+  constructor(
+    readonly reason: "unknown_item" | "limit_reached",
+    readonly clientError: number = reason === "limit_reached" ? 20075 : 20074,
+  ) {
+    super(`IB shop error: ${reason}`);
+    this.name = "IBShopError";
   }
 }
 
@@ -2181,6 +2208,50 @@ export class PlayerRepository {
     });
     if (!player) throw new Error(`Failed to save pending gacha: ${account}`);
     return structuredClone(player);
+  }
+
+  async claimIBShopFreePack(
+    account: string,
+    now = Date.now(),
+  ): Promise<IBShopFreePackResult> {
+    let player: Player | undefined;
+    let item: InventoryEntryState | undefined;
+    let purchaseCount = 0;
+    const updatedItemGuids = new Set<number>();
+    await this.#store.update((state) => {
+      player = state.players[account];
+      if (!player) throw new Error(`Unknown player account: ${account}`);
+      const operationalDate = bountyOperationalDate(now);
+      const taskId = String(makeIBShopTaskId(FREE_GIFT_PACK_ID));
+      if (player.ibShop?.operationalDate !== operationalDate) {
+        player.ibShop = { operationalDate };
+        player.taskValues[taskId] = 0;
+      }
+      purchaseCount = player.taskValues[taskId] ?? 0;
+      if (purchaseCount >= FREE_GIFT_PACK_DAILY_LIMIT) {
+        throw new IBShopError("limit_reached");
+      }
+      purchaseCount += 1;
+      player.taskValues[taskId] = purchaseCount;
+      addInventoryAward(player, FREE_GIFT_PACK_AWARD, updatedItemGuids);
+      item = player.inventory.find(({ guid }) => updatedItemGuids.has(guid));
+    });
+    if (!player || !item) {
+      throw new Error(`Failed to claim IB shop free pack: ${account}`);
+    }
+    const itemGuid = item.guid;
+    const snapshot = structuredClone(player);
+    const claimedItem = snapshot.inventory.find(({ guid }) => guid === itemGuid);
+    if (!claimedItem) {
+      throw new Error(`Failed to claim IB shop free pack: ${account}`);
+    }
+    this.#logger.info("player.ib_shop.free_pack_claimed", {
+      account,
+      packId: FREE_GIFT_PACK_ID,
+      purchaseCount,
+      itemGuid,
+    });
+    return { player: snapshot, item: claimedItem, purchaseCount };
   }
 
   async performGacha(

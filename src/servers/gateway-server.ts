@@ -62,6 +62,12 @@ import {
   makeShopGoodsListResponse,
 } from "../game-data/shop-data.js";
 import {
+  FREE_GIFT_PACK_AWARD,
+  FREE_GIFT_PACK_ID,
+  IB_SHOP_ERROR_UNKNOWN_ITEM,
+  LUA_COMMAND_DO_RECHARGE,
+} from "../game-data/ib-shop-data.js";
+import {
   getPhoneLetterDefinition,
   makePhoneReplyId,
 } from "../game-data/phone-message-data.js";
@@ -76,6 +82,7 @@ import {
   GirlGiftError,
   GirlLevelAwardError,
   GirlTrainingError,
+  IBShopError,
   ChapterStarAwardError,
   CharacterCardDecompositionError,
   DailyMissionError,
@@ -212,6 +219,33 @@ interface GirlGiftCall {
 interface GirlLevelAwardCall {
   girlId: number;
   level: number;
+}
+
+interface DoRechargeCall {
+  shopType: number;
+  id: number;
+}
+
+function parseDoRechargeCall(call: LuaCall | null): DoRechargeCall | null {
+  if (
+    call?.method !== "LuaCall" ||
+    typeof call.parameters !== "object" ||
+    call.parameters === null
+  ) {
+    return null;
+  }
+  const parameters = call.parameters as Record<string, unknown>;
+  if (parameters.sCmd !== LUA_COMMAND_DO_RECHARGE) return null;
+  if (typeof parameters.tbParam !== "object" || parameters.tbParam === null) {
+    return null;
+  }
+  const tbParam = parameters.tbParam as Record<string, unknown>;
+  const shopType = Number(tbParam.Type);
+  const id = Number(tbParam.Id);
+  if (!Number.isSafeInteger(shopType) || !Number.isSafeInteger(id) || id <= 0) {
+    return null;
+  }
+  return { shopType, id };
 }
 
 function parseGirlGiftCall(call: LuaCall | null): GirlGiftCall | null {
@@ -755,6 +789,7 @@ export function createGatewayServer({
         const girlTrainingCall = parseGirlTrainingCall(call);
         const girlAppearanceCall = parseGirlAppearanceCall(call);
         const girlGiftCall = parseGirlGiftCall(call);
+        const doRechargeCall = parseDoRechargeCall(call);
         const girlLevelAwardCall = parseGirlLevelAwardCall(call);
         const girlEndTrainCall = parseGirlEndTrainCall(call);
         logger.info("lua.call", {
@@ -3087,6 +3122,74 @@ export function createGatewayServer({
               method: call.method,
               command: call.parameters.sCmd,
             });
+          } else if (doRechargeCall) {
+            const sendRechargeCallback = (tbParam: Record<string, unknown>): void => {
+              send(
+                COMMAND.NTF_S2C_CALL,
+                0,
+                makeServerLuaCall("LuaCall", {
+                  sCmd: LUA_COMMAND_DO_RECHARGE,
+                  tbParam,
+                }),
+              );
+            };
+            if (
+              doRechargeCall.shopType !== 1 ||
+              doRechargeCall.id !== FREE_GIFT_PACK_ID
+            ) {
+              sendRechargeCallback({
+                Type: doRechargeCall.shopType,
+                Id: doRechargeCall.id,
+                Error: IB_SHOP_ERROR_UNKNOWN_ITEM,
+              });
+              logger.warn("ib_shop.unsupported", {
+                peer,
+                account: context.account,
+                ...doRechargeCall,
+              });
+            } else {
+              try {
+                const result = await players.claimIBShopFreePack(context.account);
+                context.player = result.player;
+                send(
+                  COMMAND.ITEM_UPDATE_NTF,
+                  0,
+                  makeItemUpdateNotification([result.item]),
+                );
+                send(
+                  COMMAND.TASK_VALUE_RSP,
+                  0,
+                  makeTaskValueSync(result.player.taskValues),
+                );
+                sendRechargeCallback({
+                  Type: 1,
+                  Id: FREE_GIFT_PACK_ID,
+                  Error: 0,
+                  tbItem: [FREE_GIFT_PACK_AWARD],
+                });
+                logger.info("ib_shop.free_pack.claimed", {
+                  peer,
+                  account: context.account,
+                  packId: FREE_GIFT_PACK_ID,
+                  purchaseCount: result.purchaseCount,
+                  itemGuid: result.item.guid,
+                });
+              } catch (error) {
+                if (!(error instanceof IBShopError)) throw error;
+                sendRechargeCallback({
+                  Type: 1,
+                  Id: FREE_GIFT_PACK_ID,
+                  Error: error.clientError,
+                });
+                logger.warn("ib_shop.free_pack.rejected", {
+                  peer,
+                  account: context.account,
+                  packId: FREE_GIFT_PACK_ID,
+                  reason: error.reason,
+                  clientError: error.clientError,
+                });
+              }
+            }
           } else {
             logger.warn("lua.unhandled", {
               peer,
