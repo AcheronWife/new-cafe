@@ -7,6 +7,7 @@ import {
 } from "./protobuf.js";
 
 import type { AppConfig } from "../config.js";
+import { weaponPassiveSkills } from "../game-data/weapon-skill-data.js";
 import type {
   FightCardState,
   FormationState,
@@ -189,6 +190,14 @@ export function makeFormationUpdateNotification(formation: FormationState): Buff
   return fieldBytes(1, makeFormationInfo(formation));
 }
 
+function makeMiniSkill(skillId: number, skillLevel: number, skillType: number): Buffer {
+  return Buffer.concat([
+    fieldVarint(1, skillId),
+    fieldVarint(2, skillLevel),
+    fieldVarint(3, skillType),
+  ]);
+}
+
 function makeItemInfo(item: InventoryEntryState): Buffer {
   return Buffer.concat([
     fieldVarint(1, item.guid),
@@ -201,6 +210,15 @@ function makeItemInfo(item: InventoryEntryState): Buffer {
     fieldVarint(8, item.enhanceLevel),
     fieldVarint(9, item.enhanceExp),
     fieldVarint(10, item.breakLevel),
+    ...weaponPassiveSkills(
+      item.genre,
+      item.detail,
+      item.particular,
+      item.templateLevel,
+      item.breakLevel,
+    ).map((skill) =>
+      fieldBytes(11, makeMiniSkill(skill.skillId, skill.skillLevel, skill.skillType)),
+    ),
     fieldVarint(13, item.lockOn),
   ]);
 }
