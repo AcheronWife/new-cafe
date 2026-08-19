@@ -42,7 +42,7 @@ it("atomically consumes a ticket and persists gacha rewards and counters", async
       logger,
     });
     await repository.getOrCreate("tester");
-    await repository.settleLevel("tester", 1, 1, 1, 3, [[9, 13, 1, 1, 1, 0]], 0);
+    await repository.settleLevel("tester", 1, 1, 1, 3, 0, [[9, 13, 1, 1, 1, 0]], 0);
     const player = repository.get("tester")!;
     const catalog = GachaCatalog.loadDefault();
     const pool = catalog.get(70)!;
@@ -110,7 +110,7 @@ it("persists a weapon draw with the weapon-specific task counters", async () => 
       logger,
     });
     await repository.getOrCreate("tester");
-    await repository.settleLevel("tester", 1, 1, 1, 3, [[15, 2, 1, 1, 1_000, 0]], 0);
+    await repository.settleLevel("tester", 1, 1, 1, 3, 0, [[15, 2, 1, 1, 1_000, 0]], 0);
     const catalog = GachaCatalog.loadDefault(0);
     const pool = catalog.get(1)!;
     const roll = catalog.roll(

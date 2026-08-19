@@ -72,7 +72,7 @@ describe("daily mission persistence", () => {
       dailyMissionProgress(player.taskValues[String(makeDailyMissionTaskId(110))] ?? 0),
     ).toBe(1);
 
-    player = await repository.enterLevel("tester", 10);
+    player = await repository.chargeLevelVigour("tester", 10);
     expect(
       dailyMissionProgress(player.taskValues[String(makeDailyMissionTaskId(109))] ?? 0),
     ).toBe(10);

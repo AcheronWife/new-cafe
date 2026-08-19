@@ -3,7 +3,7 @@
 ## 当前完成度
 
 **核心可用。** 强化、锁定以及角色卡/武器分解的协议、奖励和存档闭环已实现；
-突破、技能等后续养成缺失。
+武器技能展示已随物品同步下发；突破、技能升级等后续养成缺失。
 
 ## 实例锁定
 
@@ -61,6 +61,29 @@
 - 成功回调为 `tbParam=[金币, 道具列表]`，并同步物品删除和货币变化；
 - 武器分解代币 `[15,20,1,1]` 记入 `Money ID 16`。
 
+## 武器技能展示
+
+武器检视页（`UI_WeaponInfo`）的技能区读取实例的 `passiveskill` /
+`passiveskilllevel`，由客户端 `EquipManager.AddWeapon` 从
+`gsproto.ItemInfo.skillinfo`（Protobuf field 11，repeated `MiniSkill`）
+填充：
+
+- `skilltype=1` → `MainSkillLevel`（战斗用，当前不下发）；
+- `skilltype=2` → 固定被动技能槽（检视页展示的内容）；
+- `skilltype=4` → 重铸技能槽（重铸未实现，不下发）。
+
+服务端在 `makeItemInfo` 中为武器（genre 2）按模板表
+`resources/weapon/weapons.txt` 下发 `PassiveSkill1`/`PassiveSkill2`
+（`skilltype=2`），技能等级 = 突破等级 + 1（客户端
+`WeaponCommon:GetMaxSkillLevel` 与游戏内提示“武器的技能在「突破」时会相应
+提升1级”）。模板表提取自客户端 `setting.u` 的
+`Assets/_Game/SettingGen/Item/Weapon.asset`（无 typetree 的
+`FileWeaponItemBaseInfo` MonoBehaviour，按
+`docs/girl-gift-implementation.md` 第 2/4 节的 BundleEncrypt 变换 +
+手工布局解析导出，共 138 把武器、113 条固定被动技能）；技能名/描述文本
+由客户端语言表按 `_SkillDesInfo.<skillId>.Name/Desc*` 键展示，服务端无需
+下发。
+
 ## 分解奖励
 
 金币公式与客户端 `CardCommon:GetCardPrice` /
@@ -92,6 +115,7 @@ floor(达到当前等级所消耗的累计经验 * 0.3 + 稀有度 * 对应基�
 - `test/card-decomposition-persistence.test.ts`：角色卡锁定、编队限制和原子奖励；
 - `test/weapon-decomposition-data.test.ts`：武器请求、金币和代币规则；
 - `test/weapon-decomposition-persistence.test.ts`：武器锁定、装备限制和原子奖励；
+- `test/weapon-skill-data.test.ts`：模板表加载、`skillinfo` 编码与突破等级映射；
 - `test/protocol.test.ts`：`ItemInfo.lockon` 编码；
 - `test/persistence.test.ts` 间接覆盖角色卡强化。
 
@@ -99,7 +123,8 @@ floor(达到当前等级所消耗的累计经验 * 0.3 + 稀有度 * 对应基�
 
 - 角色卡没有按稀有度、突破或玩家等级限制最大等级；
 - 角色卡技能升级、觉醒、突破和副卡强化未实现；
-- 武器突破、技能和重置未实现；
+- 武器突破、技能升级（突破联动升级）和重置未实现；
+- 武器重铸技能（`skillinfo` skilltype 4）未实现；
 - 普通物品、物资、符文、武器模块和武器零件的出售/分解仍未实现；
 - 武器强化失败统一返回通用错误，客户端错误码没有细分；
 - 角色卡强化尚未发布活动领域事件。

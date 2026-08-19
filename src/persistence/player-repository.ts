@@ -35,6 +35,18 @@ import {
   weaponDecompositionReward,
 } from "../game-data/weapon-decomposition-data.js";
 import { INITIAL_COFFEE_TASK_VALUES, type CafeCoffee } from "../game-data/cafe-data.js";
+import {
+  FREE_GIFT_PACK_AWARD,
+  FREE_GIFT_PACK_DAILY_LIMIT,
+  FREE_GIFT_PACK_ID,
+  makeIBItemTaskId,
+  makeIBShopTaskId,
+  makeMonthCardTaskId,
+  MONTH_CARD_DAYS,
+  MONTH_CARD_DIAMONDS,
+  MONTH_CARD_ITEM_ID,
+  MONTH_CARD_LIMIT_DAYS,
+} from "../game-data/ib-shop-data.js";
 import type { Award, BaseAward } from "../game-data/chapter-config.js";
 import {
   chapterStarAward,
@@ -50,8 +62,12 @@ import {
   dailySignUpOperationalDate,
   dailySignUpReward,
   makeDailySignUpTaskId,
+  DAILY_SIGN_UP_MONTH_DIAMOND_TASK,
+  DAILY_SIGN_UP_MONTH_ENERGY_TASK,
   DAILY_SIGN_UP_TODAY_TASK,
   DAILY_SIGN_UP_TOTAL_TASK,
+  MONTH_CARD_DAILY_DIAMOND_AWARD,
+  MONTH_CARD_DAILY_ENERGY_AWARD,
 } from "../game-data/daily-sign-up-data.js";
 import {
   activeAwardsWithoutBattlePass,
@@ -285,6 +301,7 @@ export interface Player {
   dailySignUp: DailySignUpState;
   eightDaySignUp: EightDaySignUpState;
   bounty?: BountyState;
+  ibShop?: IBShopState;
 }
 
 export interface PersistedState {
@@ -301,6 +318,7 @@ export interface TaskChange {
 
 export interface ChapterSettlement {
   player: Player;
+  energyCost: number;
   updatedItems: InventoryItemState[];
   updatedMoney: MoneyState[];
   updatedGirls: GirlState[];
@@ -347,6 +365,21 @@ export interface GirlTrainingResult {
   outdoorId: number;
 }
 
+export interface GirlTrainingEndResult {
+  player: Player;
+  girl: GirlState;
+  girlId: number;
+  position: number;
+  gold: number;
+  updatedMoney: MoneyState[];
+  addedExperience: number;
+  oldExperience: number;
+  newExperience: number;
+  oldLevel: number;
+  newLevel: number;
+  unlockedSecretIds: number[];
+}
+
 export class GirlTrainingError extends Error {
   constructor(
     readonly reason:
@@ -354,7 +387,9 @@ export class GirlTrainingError extends Error {
       | "invalid_position"
       | "girl_already_training"
       | "position_occupied"
-      | "training_limit",
+      | "training_limit"
+      | "not_training"
+      | "training_not_finished",
     readonly clientError: 5 | 6 = 5,
   ) {
     super(`Girl training error: ${reason}`);
@@ -406,6 +441,34 @@ export class GirlLevelAwardError extends Error {
   constructor(readonly reason: "girl_not_owned" | "invalid_level") {
     super(`Girl level award error: ${reason}`);
     this.name = "GirlLevelAwardError";
+  }
+}
+
+export interface IBShopState {
+  operationalDate: string;
+}
+
+export interface IBShopFreePackResult {
+  player: Player;
+  item: InventoryEntryState;
+  purchaseCount: number;
+}
+
+export interface IBItemFreeResult {
+  player: Player;
+  updatedMoney: MoneyState[];
+  purchaseCount: number;
+  monthCardEndTime: number;
+  diamonds: number;
+}
+
+export class IBShopError extends Error {
+  constructor(
+    readonly reason: "unknown_item" | "limit_reached",
+    readonly clientError: number = reason === "limit_reached" ? 20075 : 20074,
+  ) {
+    super(`IB shop error: ${reason}`);
+    this.name = "IBShopError";
   }
 }
 
@@ -461,7 +524,7 @@ export interface GachaCommitResult {
 
 export interface DailySignUpResult {
   player: Player;
-  award: readonly [number, number, number, number, number] | null;
+  awards: BaseAward[];
   fresh: boolean;
   cumulativeCount: number;
   updatedItems: InventoryItemState[];
@@ -694,6 +757,32 @@ function makeGirlTaskId(group: number, girlId: number, offset: number): number {
   return (taskGroup << 16) | ((taskGirlId - 1) * GIRL_TASK_STRIDE + offset);
 }
 
+/**
+ * Unlocks the Secret.txt FitLove secrets crossed by an affection level-up
+ * (girls 1-16 only; link girls have no level-gated secrets). Returns the
+ * newly unlocked secret ids.
+ */
+function unlockGirlLevelSecrets(
+  player: Player,
+  girlId: number,
+  oldLevel: number,
+  newLevel: number,
+): number[] {
+  const unlocked: number[] = [];
+  if (girlId < 1 || girlId > 16) return unlocked;
+  for (const { secretId, level } of FIT_LOVE_SECRET_LEVELS) {
+    if (level <= oldLevel || level > newLevel) continue;
+    const key = String(
+      makeGirlTaskId(GIRL_STATE_TASK_GROUP, girlId, GIRL_SECRET_OFFSET + secretId - 1),
+    );
+    if ((player.taskValues[key] ?? 0) === 0) {
+      player.taskValues[key] = 1;
+      unlocked.push(secretId);
+    }
+  }
+  return unlocked;
+}
+
 function fixGirlModelTaskOffset(modelId: number): number {
   if (!Number.isSafeInteger(modelId) || modelId <= 0) {
     throw new Error(`Invalid girl model id: ${modelId}`);
@@ -880,13 +969,23 @@ function reconcileDailySignUp(player: Player, now = Date.now()): void {
   const cycle = operationalDate.slice(0, 7);
   const todayTaskId = String(makeDailySignUpTaskId(DAILY_SIGN_UP_TODAY_TASK));
   const totalTaskId = String(makeDailySignUpTaskId(DAILY_SIGN_UP_TOTAL_TASK));
+  const monthDiamondTaskId = String(
+    makeDailySignUpTaskId(DAILY_SIGN_UP_MONTH_DIAMOND_TASK),
+  );
+  const monthEnergyTaskId = String(
+    makeDailySignUpTaskId(DAILY_SIGN_UP_MONTH_ENERGY_TASK),
+  );
   if (player.dailySignUp.cycle !== cycle) {
     player.dailySignUp.cycle = cycle;
     player.dailySignUp.lastOperationalDate = null;
     player.taskValues[totalTaskId] = 0;
     player.taskValues[todayTaskId] = 0;
+    player.taskValues[monthDiamondTaskId] = 0;
+    player.taskValues[monthEnergyTaskId] = 0;
   } else if (player.dailySignUp.lastOperationalDate !== operationalDate) {
     player.taskValues[todayTaskId] = 0;
+    player.taskValues[monthDiamondTaskId] = 0;
+    player.taskValues[monthEnergyTaskId] = 0;
   }
 }
 
@@ -1068,11 +1167,13 @@ function grantAwards(
         ? MONEY_GOLD
         : genre === 15 && detail === 2
           ? MONEY_DIAMOND
-          : genre === 15 && detail === 11
-            ? MONEY_CARD_DECOMPOSITION_TOKEN
-            : genre === 15 && detail === 20
-              ? MONEY_WEAPON_DECOMPOSITION_TOKEN
-              : null;
+          : genre === 15 && detail === 4
+            ? MONEY_VIGOUR
+            : genre === 15 && detail === 11
+              ? MONEY_CARD_DECOMPOSITION_TOKEN
+              : genre === 15 && detail === 20
+                ? MONEY_WEAPON_DECOMPOSITION_TOKEN
+                : null;
     if (moneyId !== null) {
       let money = player.money.find(({ id }) => id === moneyId);
       if (!money) {
@@ -1481,26 +1582,9 @@ export class PlayerRepository {
       girl.exp = gain.newExperience;
 
       const taskValues = player.taskValues;
-      const unlockSecret = (secretId: number) => {
-        const key = String(
-          makeGirlTaskId(
-            GIRL_STATE_TASK_GROUP,
-            girlId,
-            GIRL_SECRET_OFFSET + secretId - 1,
-          ),
-        );
-        if ((taskValues[key] ?? 0) === 0) {
-          taskValues[key] = 1;
-          unlockedSecretIds.push(secretId);
-        }
-      };
-      if (girlId >= 1 && girlId <= 16) {
-        for (const { secretId, level } of FIT_LOVE_SECRET_LEVELS) {
-          if (level > gain.oldLevel && level <= gain.newLevel) {
-            unlockSecret(secretId);
-          }
-        }
-      }
+      unlockedSecretIds.push(
+        ...unlockGirlLevelSecrets(player, girlId, gain.oldLevel, gain.newLevel),
+      );
       for (const { secretId, gdpl } of favoriteGiftSecretIds(girlId)) {
         if (
           gdpl[0] === item[0] &&
@@ -1508,7 +1592,17 @@ export class PlayerRepository {
           gdpl[2] === item[2] &&
           gdpl[3] === item[3]
         ) {
-          unlockSecret(secretId);
+          const key = String(
+            makeGirlTaskId(
+              GIRL_STATE_TASK_GROUP,
+              girlId,
+              GIRL_SECRET_OFFSET + secretId - 1,
+            ),
+          );
+          if ((taskValues[key] ?? 0) === 0) {
+            taskValues[key] = 1;
+            unlockedSecretIds.push(secretId);
+          }
         }
       }
     });
@@ -1592,6 +1686,94 @@ export class PlayerRepository {
       throw new Error(`Failed to claim girl level award: ${account}`);
     }
     return structuredClone(player);
+  }
+
+  async endGirlTraining(
+    account: string,
+    girlId: number,
+    now = Date.now(),
+  ): Promise<GirlTrainingEndResult> {
+    let player: Player | undefined;
+    let position = 0;
+    let goldReward = 0;
+    let gain: GirlAffectionGain | null | undefined;
+    const unlockedSecretIds: number[] = [];
+    await this.#store.update((state) => {
+      player = state.players[account];
+      if (!player) throw new Error(`Unknown player account: ${account}`);
+      const girl = player.girls.find((candidate) => candidate.girlId === girlId);
+      if (!girl) throw new GirlTrainingError("girl_not_owned");
+
+      const positionKey = String(
+        makeGirlTaskId(GIRL_STATE_TASK_GROUP, girlId, GIRL_TRAIN_POSITION_OFFSET),
+      );
+      const endTimeKey = String(
+        makeGirlTaskId(GIRL_STATE_TASK_GROUP, girlId, GIRL_TRAIN_END_TIME_OFFSET),
+      );
+      position = player.taskValues[positionKey] ?? 0;
+      if (position <= 0) throw new GirlTrainingError("not_training");
+      const endTime = player.taskValues[endTimeKey] ?? 0;
+      if (endTime > 0 && Math.floor(now / 1_000) < endTime) {
+        throw new GirlTrainingError("training_not_finished");
+      }
+      const config = getGirlTrainingConfig(position);
+      if (!config) throw new GirlTrainingError("invalid_position");
+
+      gain = addGirlAffection(girlId, girl.level, girl.exp, config.loveReward);
+      if (gain) {
+        girl.level = gain.newLevel;
+        girl.exp = gain.newExperience;
+        unlockedSecretIds.push(
+          ...unlockGirlLevelSecrets(player, girlId, gain.oldLevel, gain.newLevel),
+        );
+      }
+
+      goldReward = config.crystalReward;
+      let gold = player.money.find(({ id }) => id === MONEY_GOLD);
+      if (!gold) {
+        gold = { id: MONEY_GOLD, count: 0 };
+        player.money.push(gold);
+      }
+      gold.count += goldReward;
+
+      player.taskValues[positionKey] = 0;
+      player.taskValues[endTimeKey] = 0;
+      player.taskValues[
+        String(
+          makeGirlTaskId(GIRL_STATE_TASK_GROUP, girlId, GIRL_TRAIN_OUTDOOR_ID_OFFSET),
+        )
+      ] = 0;
+    });
+    if (!player || gain === undefined) {
+      throw new Error(`Failed to end girl training: ${account}`);
+    }
+    this.#logger.info("player.girl_training.ended", {
+      account,
+      girlId,
+      position,
+      gold: goldReward,
+      addedExperience: gain?.addedExperience ?? 0,
+      oldLevel: gain?.oldLevel,
+      newLevel: gain?.newLevel,
+      unlockedSecretIds,
+    });
+    const snapshot = structuredClone(player);
+    const girl = snapshot.girls.find((candidate) => candidate.girlId === girlId);
+    if (!girl) throw new Error(`Trained girl disappeared: ${account}`);
+    return {
+      player: snapshot,
+      girl,
+      girlId,
+      position,
+      gold: goldReward,
+      updatedMoney: snapshot.money.filter(({ id }) => id === MONEY_GOLD),
+      addedExperience: gain?.addedExperience ?? 0,
+      oldExperience: gain?.oldExperience ?? girl.exp,
+      newExperience: gain?.newExperience ?? girl.exp,
+      oldLevel: gain?.oldLevel ?? girl.level,
+      newLevel: gain?.newLevel ?? girl.level,
+      unlockedSecretIds,
+    };
   }
 
   async setTaskValues(
@@ -1790,7 +1972,7 @@ export class PlayerRepository {
 
   async signUpDaily(account: string, now = Date.now()): Promise<DailySignUpResult> {
     let player: Player | undefined;
-    let award: readonly [number, number, number, number, number] | null = null;
+    const awards: BaseAward[] = [];
     let fresh = false;
     let cumulativeCount = 0;
     const updatedItemGuids = new Set<number>();
@@ -1804,52 +1986,67 @@ export class PlayerRepository {
       const operationalDate = dailySignUpOperationalDate(now);
       const todayTaskId = String(makeDailySignUpTaskId(DAILY_SIGN_UP_TODAY_TASK));
       const totalTaskId = String(makeDailySignUpTaskId(DAILY_SIGN_UP_TOTAL_TASK));
+      const monthDiamondTaskId = String(
+        makeDailySignUpTaskId(DAILY_SIGN_UP_MONTH_DIAMOND_TASK),
+      );
+      const monthEnergyTaskId = String(
+        makeDailySignUpTaskId(DAILY_SIGN_UP_MONTH_ENERGY_TASK),
+      );
       cumulativeCount = Math.max(0, player.taskValues[totalTaskId] ?? 0);
-      if (
+      const alreadySigned =
         player.dailySignUp.lastOperationalDate === operationalDate ||
-        player.taskValues[todayTaskId] === 1
-      ) {
-        return;
-      }
+        player.taskValues[todayTaskId] === 1;
 
-      award = dailySignUpReward(cumulativeCount, operationalDate);
-      if (!award) return;
-
-      const [genre, detail, particular, templateLevel, count] = award;
-      const moneyId =
-        genre === 15 && detail === 1
-          ? MONEY_GOLD
-          : genre === 15 && detail === 2
-            ? MONEY_DIAMOND
-            : null;
-      if (moneyId !== null) {
-        let money = player.money.find(({ id }) => id === moneyId);
-        if (!money) {
-          money = { id: moneyId, count: 0 };
-          player.money.push(money);
+      if (!alreadySigned) {
+        const award = dailySignUpReward(cumulativeCount, operationalDate);
+        if (award) {
+          awards.push(award);
+          grantAwards(player, [award], updatedItemGuids, updatedMoneyIds);
+          cumulativeCount += 1;
+          player.taskValues[todayTaskId] = 1;
+          player.taskValues[totalTaskId] = cumulativeCount;
+          player.dailySignUp = {
+            cycle: operationalDate.slice(0, 7),
+            lastOperationalDate: operationalDate,
+          };
+          const girlReconciliation = reconcileGirlAppearanceState(
+            player,
+            updatedItemGuids,
+          );
+          for (const girlId of girlReconciliation.updatedGirlIds) {
+            updatedGirlIds.add(girlId);
+          }
+          fresh = true;
         }
-        money.count += count;
-        updatedMoneyIds.add(moneyId);
-      } else {
-        addInventoryAward(
-          player,
-          [genre, detail, particular, templateLevel, count],
-          updatedItemGuids,
-        );
       }
 
-      cumulativeCount += 1;
-      player.taskValues[todayTaskId] = 1;
-      player.taskValues[totalTaskId] = cumulativeCount;
-      player.dailySignUp = {
-        cycle: operationalDate.slice(0, 7),
-        lastOperationalDate: operationalDate,
-      };
-      const girlReconciliation = reconcileGirlAppearanceState(player, updatedItemGuids);
-      for (const girlId of girlReconciliation.updatedGirlIds) {
-        updatedGirlIds.add(girlId);
+      // 月卡持有者的每日钻石/体力签到（UI_SignActivity 读组20的11004/11005）。
+      // 即使当天普通签到已完成也要补签月卡部分（先签到后购卡的边缘情况），
+      // 否则客户端签到按钮常亮、登录弹窗反复出现。
+      const nowSeconds = Math.floor(now / 1000);
+      const monthCardEnd = player.taskValues[String(makeMonthCardTaskId())] ?? 0;
+      if (monthCardEnd >= nowSeconds) {
+        if ((player.taskValues[monthDiamondTaskId] ?? 0) === 0) {
+          player.taskValues[monthDiamondTaskId] = 1;
+          awards.push(MONTH_CARD_DAILY_DIAMOND_AWARD);
+          grantAwards(
+            player,
+            [MONTH_CARD_DAILY_DIAMOND_AWARD],
+            updatedItemGuids,
+            updatedMoneyIds,
+          );
+        }
+        if ((player.taskValues[monthEnergyTaskId] ?? 0) === 0) {
+          player.taskValues[monthEnergyTaskId] = 1;
+          awards.push(MONTH_CARD_DAILY_ENERGY_AWARD);
+          grantAwards(
+            player,
+            [MONTH_CARD_DAILY_ENERGY_AWARD],
+            updatedItemGuids,
+            updatedMoneyIds,
+          );
+        }
       }
-      fresh = true;
     });
     if (!player) throw new Error(`Failed to sign in player: ${account}`);
     const snapshot = structuredClone(player);
@@ -1858,11 +2055,11 @@ export class PlayerRepository {
       operationalDate: dailySignUpOperationalDate(now),
       cumulativeCount,
       fresh,
-      award,
+      awards,
     });
     return {
       player: snapshot,
-      award,
+      awards,
       fresh,
       cumulativeCount,
       updatedItems: snapshot.inventory.filter(({ guid }) => updatedItemGuids.has(guid)),
@@ -2056,6 +2253,103 @@ export class PlayerRepository {
     });
     if (!player) throw new Error(`Failed to save pending gacha: ${account}`);
     return structuredClone(player);
+  }
+
+  async claimIBShopFreePack(
+    account: string,
+    now = Date.now(),
+  ): Promise<IBShopFreePackResult> {
+    let player: Player | undefined;
+    let item: InventoryEntryState | undefined;
+    let purchaseCount = 0;
+    const updatedItemGuids = new Set<number>();
+    await this.#store.update((state) => {
+      player = state.players[account];
+      if (!player) throw new Error(`Unknown player account: ${account}`);
+      const operationalDate = bountyOperationalDate(now);
+      const taskId = String(makeIBShopTaskId(FREE_GIFT_PACK_ID));
+      if (player.ibShop?.operationalDate !== operationalDate) {
+        player.ibShop = { operationalDate };
+        player.taskValues[taskId] = 0;
+      }
+      purchaseCount = player.taskValues[taskId] ?? 0;
+      if (purchaseCount >= FREE_GIFT_PACK_DAILY_LIMIT) {
+        throw new IBShopError("limit_reached");
+      }
+      purchaseCount += 1;
+      player.taskValues[taskId] = purchaseCount;
+      addInventoryAward(player, FREE_GIFT_PACK_AWARD, updatedItemGuids);
+      item = player.inventory.find(({ guid }) => updatedItemGuids.has(guid));
+    });
+    if (!player || !item) {
+      throw new Error(`Failed to claim IB shop free pack: ${account}`);
+    }
+    const itemGuid = item.guid;
+    const snapshot = structuredClone(player);
+    const claimedItem = snapshot.inventory.find(({ guid }) => guid === itemGuid);
+    if (!claimedItem) {
+      throw new Error(`Failed to claim IB shop free pack: ${account}`);
+    }
+    this.#logger.info("player.ib_shop.free_pack_claimed", {
+      account,
+      packId: FREE_GIFT_PACK_ID,
+      purchaseCount,
+      itemGuid,
+    });
+    return { player: snapshot, item: claimedItem, purchaseCount };
+  }
+
+  async claimIBItemFree(
+    account: string,
+    itemId: number,
+    now = Date.now(),
+  ): Promise<IBItemFreeResult> {
+    if (itemId !== MONTH_CARD_ITEM_ID) throw new IBShopError("unknown_item");
+    let player: Player | undefined;
+    let purchaseCount = 0;
+    let monthCardEndTime = 0;
+    const updatedMoneyIds = new Set<number>();
+    await this.#store.update((state) => {
+      player = state.players[account];
+      if (!player) throw new Error(`Unknown player account: ${account}`);
+      const taskId = String(makeIBItemTaskId(itemId));
+      purchaseCount = (player.taskValues[taskId] ?? 0) + 1;
+      player.taskValues[taskId] = purchaseCount;
+
+      let diamond = player.money.find(({ id }) => id === MONEY_DIAMOND);
+      if (!diamond) {
+        diamond = { id: MONEY_DIAMOND, count: 0 };
+        player.money.push(diamond);
+      }
+      diamond.count += MONTH_CARD_DIAMONDS;
+      updatedMoneyIds.add(MONEY_DIAMOND);
+
+      const monthTaskId = String(makeMonthCardTaskId());
+      const nowSeconds = Math.floor(now / 1000);
+      const currentEnd = player.taskValues[monthTaskId] ?? 0;
+      const base = Math.max(nowSeconds, currentEnd);
+      monthCardEndTime = Math.min(
+        base + MONTH_CARD_DAYS * 86_400,
+        nowSeconds + MONTH_CARD_LIMIT_DAYS * 86_400,
+      );
+      player.taskValues[monthTaskId] = monthCardEndTime;
+    });
+    if (!player) throw new Error(`Failed to claim IB item: ${account}`);
+    const snapshot = structuredClone(player);
+    this.#logger.info("player.ib_item.free_claimed", {
+      account,
+      itemId,
+      purchaseCount,
+      diamonds: MONTH_CARD_DIAMONDS,
+      monthCardEndTime,
+    });
+    return {
+      player: snapshot,
+      updatedMoney: snapshot.money.filter(({ id }) => updatedMoneyIds.has(id)),
+      purchaseCount,
+      monthCardEndTime,
+      diamonds: MONTH_CARD_DIAMONDS,
+    };
   }
 
   async performGacha(
@@ -2874,7 +3168,7 @@ export class PlayerRepository {
     };
   }
 
-  async enterLevel(account: string, energyCost: number): Promise<Player> {
+  async chargeLevelVigour(account: string, energyCost: number): Promise<Player> {
     if (!Number.isSafeInteger(energyCost) || energyCost < 0) {
       throw new Error(`Invalid level energy cost: ${energyCost}`);
     }
@@ -2895,8 +3189,8 @@ export class PlayerRepository {
       }
       incrementDailyMissionProgress(player, 109, energyCost);
     });
-    this.#logger.info("player.level.entered", { account, energyCost });
-    if (!player) throw new Error(`Failed to enter level: ${account}`);
+    this.#logger.info("player.level.vigour_charged", { account, energyCost });
+    if (!player) throw new Error(`Failed to charge level vigour: ${account}`);
     return structuredClone(player);
   }
 
@@ -3017,6 +3311,7 @@ export class PlayerRepository {
     index: number,
     difficulty: number,
     star: number,
+    energyCost: number,
     awards: readonly Award[],
     masterExp: number,
   ): Promise<ChapterSettlement> {
@@ -3026,6 +3321,9 @@ export class PlayerRepository {
       )
     ) {
       throw new Error("Invalid level coordinates");
+    }
+    if (!Number.isSafeInteger(energyCost) || energyCost < 0) {
+      throw new Error(`Invalid level energy cost: ${energyCost}`);
     }
 
     const levelId = makeLevelId(chapter, index, difficulty);
@@ -3038,6 +3336,19 @@ export class PlayerRepository {
     await this.#store.update((state) => {
       player = state.players[account];
       if (!player) throw new Error(`Unknown player account: ${account}`);
+
+      let vigour = player.money.find(({ id }) => id === MONEY_VIGOUR);
+      const available = vigour?.count ?? 0;
+      if (available < energyCost) {
+        throw new InsufficientVigourError(energyCost, available);
+      }
+      if (!vigour) {
+        vigour = { id: MONEY_VIGOUR, count: 0 };
+        player.money.push(vigour);
+      }
+      vigour.count -= energyCost;
+      updatedMoneyIds.add(MONEY_VIGOUR);
+      incrementDailyMissionProgress(player, 109, energyCost);
 
       const level = player.levels.find(({ id }) => id === levelId);
       const firstClear = !level || level.star >>> 3 === 0;
@@ -3159,6 +3470,7 @@ export class PlayerRepository {
       account,
       levelId,
       star: starMask,
+      energyCost,
       awards,
       masterExp,
       experienceUpdate,
@@ -3166,6 +3478,7 @@ export class PlayerRepository {
     const snapshot = structuredClone(player);
     return {
       player: snapshot,
+      energyCost,
       updatedItems: snapshot.inventory.filter(({ guid }) => updatedItemGuids.has(guid)),
       updatedMoney: snapshot.money.filter(({ id }) => updatedMoneyIds.has(id)),
       updatedGirls: snapshot.girls.filter(({ girlId }) => updatedGirlIds.has(girlId)),
